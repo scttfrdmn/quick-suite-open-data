@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-01
+
+### Added
+- DynamoDB search result cache for `roda_search` with 1-hour TTL; cache key is SHA-256 of query + tags + format + max_results; skipped for empty queries and paginated requests
+- Pagination support in `roda_search`: `pagination_token` input decoded to `ExclusiveStartKey`; `next_token` (base64-encoded `LastEvaluatedKey`) returned in every response
+- `claws_source_id` field in `roda_load` responses (`roda-{slug}`) and `s3_load` responses (`s3-{normalized-label}`) for downstream clAWS handoff
+
+### Changed
+- `roda_search` ranking improvements: exact full-name keyword match adds 5× bonus per keyword; deprecated datasets penalised at 0.5× score multiplier; `daily` update-frequency datasets boosted 1.2×, `weekly` boosted 1.1×
+- CI workflow CDK synth step uses `--no-asset-bundling` to skip Docker pyarrow layer build in CI
+
 ## [0.2.0] - 2026-04-01
 
 ### Added
@@ -27,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared `data_utils` Lambda layer for format detection and schema inference
 - CDK stack with AgentCore Gateway Lambda target wiring and IAM policies scoped to configured sources
 
-[unreleased]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/quick-suite-open-data/releases/tag/v0.1.0

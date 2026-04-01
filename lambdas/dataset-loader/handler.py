@@ -201,6 +201,7 @@ def handler(event: dict, context: Any) -> dict:
         'manifestUri': f's3://{MANIFEST_BUCKET}/{manifest_key}',
         'registryUrl': item.get('registryUrl', ''),
         'quicksightResult': qs_result,
+        'claws_source_id': f'roda-{slug}',
     }
 
 

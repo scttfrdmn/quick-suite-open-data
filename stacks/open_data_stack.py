@@ -89,6 +89,18 @@ class OpenDataStack(Stack):
         # -----------------------------------------------------------------
         # DynamoDB: RODA Catalog
         # -----------------------------------------------------------------
+        search_cache_table = dynamodb.Table(
+            self,
+            "RodaSearchCache",
+            table_name=f"{prefix}-roda-search-cache",
+            partition_key=dynamodb.Attribute(
+                name="cache_key", type=dynamodb.AttributeType.STRING
+            ),
+            time_to_live_attribute="ttl",
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
         catalog_table = dynamodb.Table(
             self,
             "RodaCatalog",
@@ -207,9 +219,11 @@ class OpenDataStack(Stack):
             memory_size=256,
             environment={
                 "TABLE_NAME": catalog_table.table_name,
+                "SEARCH_CACHE_TABLE": search_cache_table.table_name,
             },
         )
         catalog_table.grant_read_data(search_fn)
+        search_cache_table.grant_read_write_data(search_fn)
 
         # -----------------------------------------------------------------
         # Lambda: RODA Load (AgentCore tool: roda_load)

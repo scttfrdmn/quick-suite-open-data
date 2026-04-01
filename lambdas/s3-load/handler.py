@@ -11,6 +11,7 @@ Creates a Quick Sight data source + dataset from the specified S3 path.
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -148,6 +149,7 @@ def handler(event: dict, context: Any) -> dict:
         'format': fmt,
         'manifestUri': f's3://{MANIFEST_BUCKET}/{manifest_key}',
         'quicksightResult': qs_result,
+        'claws_source_id': f's3-{re.sub(r"[^a-z0-9-]", "-", source_label.lower())}',
     }
 
 

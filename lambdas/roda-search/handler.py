@@ -10,10 +10,13 @@ Supports three search modes:
 3. Combined — tag filter + keyword refinement
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import boto3
@@ -24,6 +27,8 @@ logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
 TABLE_NAME = os.environ['TABLE_NAME']
+CACHE_TABLE = os.environ.get('SEARCH_CACHE_TABLE', '')
+CACHE_TTL = 3600  # seconds
 
 # Tags that map to common research domains
 DOMAIN_TAG_MAP = {
@@ -56,6 +61,7 @@ def handler(event: dict, context: Any) -> dict:
     - region: str — filter by AWS region
     - max_results: int — default 10, max 50
     - quicksight_compatible: bool — only return CSV/Parquet/JSON datasets
+    - pagination_token: str — opaque token from a previous response's next_token
     """
     _tool_name = "unknown"
     try:
@@ -79,8 +85,28 @@ def handler(event: dict, context: Any) -> dict:
                 'error': "'max_results' must be between 1 and 50"}
     qs_only = event.get('quicksight_compatible', False)
 
+    # Decode pagination token
+    pagination_token = str(event.get('pagination_token') or '').strip()
+    exclusive_start_key = None
+    if pagination_token:
+        try:
+            exclusive_start_key = json.loads(base64.b64decode(pagination_token).decode())
+        except Exception:
+            return {'count': 0, 'datasets': [], 'query': '', 'appliedTags': [], 'appliedFormat': '',
+                    'error': 'Invalid pagination_token'}
+
+    # Check search cache (only for non-paginated, non-empty-query requests)
+    cache_key = None
+    if CACHE_TABLE and query and not exclusive_start_key:
+        cache_key = _make_cache_key(query, tags, fmt, max_results)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            cached['cache_hit'] = True
+            return cached
+
     table = dynamodb.Table(TABLE_NAME)
     results = []
+    last_evaluated_key = None
 
     # Infer domain tags from natural language query
     if query and not tags:
@@ -88,10 +114,14 @@ def handler(event: dict, context: Any) -> dict:
 
     # Strategy 1: If we have a single primary tag, use the GSI
     if len(tags) == 1:
-        results = query_by_tag(table, tags[0], max_results * 3)
+        results, last_evaluated_key = query_by_tag(
+            table, tags[0], max_results * 3, exclusive_start_key
+        )
     # Strategy 2: Multiple tags or no tags — scan with filters
     else:
-        results = scan_with_filters(table, tags, max_results * 3)
+        results, last_evaluated_key = scan_with_filters(
+            table, tags, max_results * 3, exclusive_start_key
+        )
 
     # Keyword filter on results
     if query:
@@ -120,30 +150,86 @@ def handler(event: dict, context: Any) -> dict:
     results = results[:max_results]
     projected = [project_result(r) for r in results]
 
-    return {
+    # Encode next_token for pagination
+    next_token = ''
+    if last_evaluated_key:
+        next_token = base64.b64encode(json.dumps(last_evaluated_key).encode()).decode()
+
+    response = {
         'count': len(projected),
         'datasets': projected,
         'query': query,
         'appliedTags': tags,
         'appliedFormat': fmt,
+        'next_token': next_token,
+        'cache_hit': False,
     }
 
+    # Write to cache (only non-paginated, non-empty-query responses)
+    if CACHE_TABLE and query and cache_key and not exclusive_start_key:
+        _cache_put(cache_key, response)
 
-def query_by_tag(table, tag: str, limit: int) -> list:
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _make_cache_key(query: str, tags: list, fmt: str, max_results: int) -> str:
+    raw = f"{query}|{sorted(tags)}|{fmt}|{max_results}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _cache_get(key: str):
     try:
-        resp = table.query(
-            IndexName='by-primary-tag',
-            KeyConditionExpression=Key('primaryTag').eq(tag),
-            Limit=limit,
-        )
-        return resp.get('Items', [])
+        table = dynamodb.Table(CACHE_TABLE)
+        resp = table.get_item(Key={'cache_key': key})
+        item = resp.get('Item')
+        if item and int(item.get('ttl', 0)) > int(time.time()):
+            return json.loads(item['payload'])
+    except Exception as e:
+        logger.warning(f"Cache get failed: {e}")
+    return None
+
+
+def _cache_put(key: str, payload: dict):
+    try:
+        table = dynamodb.Table(CACHE_TABLE)
+        table.put_item(Item={
+            'cache_key': key,
+            'payload': json.dumps(payload),
+            'ttl': int(time.time()) + CACHE_TTL,
+        })
+    except Exception as e:
+        logger.warning(f"Cache put failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# DynamoDB query/scan helpers
+# ---------------------------------------------------------------------------
+
+def query_by_tag(table, tag: str, limit: int, exclusive_start_key=None) -> tuple:
+    kwargs = {
+        'IndexName': 'by-primary-tag',
+        'KeyConditionExpression': Key('primaryTag').eq(tag),
+        'Limit': limit,
+    }
+    if exclusive_start_key:
+        kwargs['ExclusiveStartKey'] = exclusive_start_key
+    try:
+        resp = table.query(**kwargs)
+        return resp.get('Items', []), resp.get('LastEvaluatedKey')
     except Exception as e:
         logger.warning(f"GSI query failed for tag '{tag}': {e}")
-        return []
+        return [], None
 
 
-def scan_with_filters(table, tags: list, limit: int) -> list:
+def scan_with_filters(table, tags: list, limit: int, exclusive_start_key=None) -> tuple:
     scan_kwargs = {'Limit': limit}
+
+    if exclusive_start_key:
+        scan_kwargs['ExclusiveStartKey'] = exclusive_start_key
 
     if tags:
         filter_parts = []
@@ -161,22 +247,28 @@ def scan_with_filters(table, tags: list, limit: int) -> list:
     try:
         resp = table.scan(**scan_kwargs)
         items = resp.get('Items', [])
+        last_key = resp.get('LastEvaluatedKey')
 
         page_count = 0
-        while 'LastEvaluatedKey' in resp and len(items) < limit and page_count < MAX_SCAN_PAGES:
+        while last_key and len(items) < limit and page_count < MAX_SCAN_PAGES:
             page_count += 1
-            scan_kwargs['ExclusiveStartKey'] = resp['LastEvaluatedKey']
+            scan_kwargs['ExclusiveStartKey'] = last_key
             resp = table.scan(**scan_kwargs)
             items.extend(resp.get('Items', []))
+            last_key = resp.get('LastEvaluatedKey')
 
         if page_count >= MAX_SCAN_PAGES and len(items) < limit:
             logger.warning(f"Scan hit page cap ({MAX_SCAN_PAGES}) with {len(items)} results")
 
-        return items[:limit]
+        return items[:limit], last_key
     except Exception as e:
         logger.error(f"Scan failed: {e}")
-        return []
+        return [], None
 
+
+# ---------------------------------------------------------------------------
+# Ranking helpers
+# ---------------------------------------------------------------------------
 
 def infer_tags(query: str) -> list:
     query_lower = query.lower()
@@ -214,9 +306,23 @@ def keyword_rank(items: list, keywords: list) -> list:
         text = item.get('searchText') or ''
         score = sum(1 for kw in keywords if kw in text)
         name = (item.get('name') or '').lower()
+        # Standard name match (3x weight)
         score += sum(3 for kw in keywords if kw in name)
+        # Exact full-name match bonus (5x extra per keyword)
+        score += sum(5 for kw in keywords if kw == name)
         tags_text = ' '.join(item.get('tags') or [])
         score += sum(2 for kw in keywords if kw in tags_text)
+
+        # Apply score multipliers
+        if item.get('deprecated', False):
+            score = score * 0.5
+
+        update_freq = (item.get('updateFrequency') or '').lower()
+        if update_freq == 'daily':
+            score = score * 1.2
+        elif update_freq == 'weekly':
+            score = score * 1.1
+
         scored.append((score, item))
     scored.sort(key=lambda x: x[0], reverse=True)
     # Return items with a keyword match; if nothing matched at all, return
@@ -224,6 +330,10 @@ def keyword_rank(items: list, keywords: list) -> list:
     filtered = [item for score, item in scored if score > 0]
     return filtered if filtered else [item for _, item in scored]
 
+
+# ---------------------------------------------------------------------------
+# Projection
+# ---------------------------------------------------------------------------
 
 def project_result(item: dict) -> dict:
     s3_resources = item.get('s3Resources', [])
