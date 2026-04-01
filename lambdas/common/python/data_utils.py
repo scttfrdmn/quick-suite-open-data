@@ -140,12 +140,40 @@ def infer_schema_from_json(content: bytes, max_rows: int = 5) -> dict:
         return {'columns': [], 'sample_rows': [], 'row_count': 0, 'format': 'json', 'error': str(e)}
 
 
+def infer_schema_from_parquet(content: bytes) -> dict:
+    """Infer schema and sample rows from Parquet bytes. Requires pyarrow layer."""
+    try:
+        import io
+        import pyarrow.parquet as pq
+        table = pq.read_table(io.BytesIO(content))
+        schema = table.schema
+        columns = [field.name for field in schema]
+        n = min(5, table.num_rows)
+        sample_dict = table.slice(0, n).to_pydict()
+        rows = [{col: sample_dict[col][i] for col in columns} for i in range(n)]
+        return {
+            'columns': columns,
+            'sample_rows': rows,
+            'row_count': table.num_rows,
+            'format': 'parquet',
+            'parquet_schema': str(schema),
+        }
+    except ImportError:
+        return {'columns': [], 'sample_rows': [], 'row_count': 0, 'format': 'parquet',
+                'note': 'Schema inference for parquet requires the pyarrow Lambda layer.'}
+    except Exception as e:
+        logger.warning(f"Parquet schema inference failed: {e}")
+        return {'columns': [], 'sample_rows': [], 'row_count': 0, 'format': 'parquet',
+                'error': str(e)}
+
+
 def infer_schema_from_bytes(content: bytes, fmt: str) -> dict:
     """Route schema inference to the right handler based on format."""
     if fmt in ('csv', 'tsv'):
         return infer_schema_from_csv(content)
     if fmt in ('json', 'ndjson'):
         return infer_schema_from_json(content)
-    # Parquet requires pyarrow — return a stub; the layer handles it
+    if fmt == 'parquet':
+        return infer_schema_from_parquet(content)
     return {'columns': [], 'sample_rows': [], 'row_count': 0, 'format': fmt,
-            'note': f'Schema inference for {fmt} requires the pyarrow Lambda layer.'}
+            'note': f'Schema inference for {fmt} is not supported.'}

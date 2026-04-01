@@ -136,6 +136,16 @@ class OpenDataStack(Stack):
             description="Shared data utilities (detect_formats, schema inference)",
         )
 
+        # pyarrow layer — Docker-built binary layer for Parquet schema inference.
+        # Attached to s3-preview only; other Lambdas use common_layer only.
+        pyarrow_layer = lambda_.LayerVersion(
+            self,
+            "PyarrowLayer",
+            code=lambda_.Code.from_docker_build(path="lambdas/pyarrow-layer"),
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_12],
+            description="pyarrow for Parquet schema inference in s3_preview",
+        )
+
         # -----------------------------------------------------------------
         # Lambda: Catalog Sync (EventBridge — not an AgentCore tool)
         # -----------------------------------------------------------------
@@ -280,7 +290,7 @@ class OpenDataStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_12,
             handler="handler.handler",
             code=lambda_.Code.from_asset("lambdas/s3-preview"),
-            layers=[common_layer],
+            layers=[common_layer, pyarrow_layer],
             timeout=Duration.seconds(30),
             memory_size=512,
             environment=s3_browse_env,
