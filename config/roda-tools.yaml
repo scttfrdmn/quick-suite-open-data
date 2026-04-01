@@ -1,0 +1,136 @@
+# RODA Tool Definitions for QuickSuite Model Router
+#
+# Add these to your config/routing_config.yaml under the `tools:` section.
+# The router's LLM will use these tools to search and load open datasets.
+
+tools:
+  roda_search:
+    type: lambda
+    lambda_arn: ${RODA_SEARCH_ARN}
+    description: |
+      Search the Registry of Open Data on AWS for publicly available datasets.
+      Over 500 datasets across genomics, climate, satellite imagery, neuroscience,
+      geospatial, health, agriculture, and more. All data is freely accessible
+      from S3 buckets. Use this when a user asks about available datasets,
+      wants to explore data for a research question, or needs to find specific
+      types of scientific data.
+
+      Returns dataset name, description, tags, data formats, S3 bucket info,
+      license, and whether the data can be directly loaded into QuickSight.
+    parameters:
+      query:
+        type: string
+        required: true
+        description: |
+          Natural language search query describing what kind of data the user
+          needs. Examples: "genomics variant call data", "NOAA weather radar",
+          "satellite imagery for climate research", "machine learning training
+          datasets for NLP"
+      tags:
+        type: array
+        items: { type: string }
+        required: false
+        description: |
+          Filter by domain tags. Common tags: genomics, climate, satellite,
+          neuroscience, biodiversity, astronomy, geospatial, health,
+          agriculture, oceans, machine-learning, chemistry, economics,
+          transportation, energy
+      format:
+        type: string
+        required: false
+        description: |
+          Filter by data format. Options: csv, tsv, parquet, json, zarr,
+          netcdf, geotiff, vcf, bam, fastq, hdf5, grib, shapefile
+      region:
+        type: string
+        required: false
+        description: AWS region filter (e.g. us-east-1, eu-west-1)
+      max_results:
+        type: integer
+        required: false
+        default: 10
+        description: Maximum results to return (1-50)
+      quicksight_compatible:
+        type: boolean
+        required: false
+        default: false
+        description: |
+          If true, only return datasets with formats QuickSight can directly
+          ingest (CSV, TSV, Parquet, JSON). Useful when the user wants to
+          immediately visualize data.
+    routing:
+      preferred:
+        - bedrock/amazon.nova-lite-v1:0   # Fast, cheap — good for search
+        - bedrock/amazon.nova-pro-v1:0
+
+  roda_load_dataset:
+    type: lambda
+    lambda_arn: ${RODA_LOADER_ARN}
+    description: |
+      Load an open dataset from the Registry of Open Data on AWS into
+      QuickSight. Creates an S3 manifest and registers the data as a
+      QuickSight data source. Use this after roda_search when the user
+      has identified a dataset they want to explore in QuickSight.
+
+      For datasets in CSV, TSV, Parquet, or JSON format, loading is direct.
+      For other formats (NetCDF, Zarr, VCF, etc.), the tool will indicate
+      that a transformation step is needed via the compute layer.
+    parameters:
+      slug:
+        type: string
+        required: true
+        description: Dataset slug from roda_search results
+      resource_index:
+        type: integer
+        required: false
+        default: 0
+        description: Which S3 resource to use if dataset has multiple buckets
+      prefix:
+        type: string
+        required: false
+        description: |
+          S3 key prefix to narrow to a specific subset of the dataset.
+          Useful for large datasets organized by date, region, or partition.
+      format:
+        type: string
+        required: false
+        description: |
+          Data format hint. If not provided, auto-detected from catalog
+          metadata. Options: csv, tsv, parquet, json
+      sample_only:
+        type: boolean
+        required: false
+        default: false
+        description: |
+          If true, only load the first 10 files for a quick preview.
+          Useful for large datasets where the user wants to see the
+          schema before committing to a full load.
+      dataset_name:
+        type: string
+        required: false
+        description: Custom name for the QuickSight dataset
+    routing:
+      preferred:
+        - bedrock/amazon.nova-pro-v1:0
+        - bedrock/anthropic.claude-sonnet-4-20250514-v1:0
+
+# System prompt addition for RODA-aware conversations
+system_prompt_additions:
+  roda: |
+    You have access to the Registry of Open Data on AWS, which contains
+    over 500 publicly available datasets across many scientific domains.
+    When a user asks about finding data, exploring datasets, or loading
+    public data for analysis, use the roda_search tool to find relevant
+    datasets. If they want to load data into QuickSight, use roda_load_dataset.
+
+    When presenting search results:
+    - Lead with the dataset name and a one-sentence description
+    - Mention the data format and whether it's QuickSight-compatible
+    - Note the license and any access requirements
+    - If the user seems interested, offer to load it directly
+
+    When loading datasets:
+    - Start with sample_only=true for large datasets so the user can
+      preview the schema
+    - Explain any format limitations (e.g., NetCDF needs transformation)
+    - Mention the registry URL for documentation

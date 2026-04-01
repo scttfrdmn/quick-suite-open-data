@@ -1,0 +1,82 @@
+# S3 Browser Tool Definitions
+# These tools expose institutional S3 data sources through AgentCore Gateway.
+# Deployed as AgentCore Lambda targets — no API Gateway needed.
+
+tools:
+  s3_browse:
+    description: >
+      List files and folders in an institutional S3 data source.
+      Returns available sources if no source is specified.
+      Use this before s3_preview or s3_load to discover what data is available.
+    parameters:
+      source:
+        type: string
+        description: >
+          Label of the institutional data source. Omit to list all available sources.
+        required: false
+      prefix:
+        type: string
+        description: >
+          S3 key prefix within the source to browse. Use paths returned by previous
+          s3_browse calls to navigate deeper.
+        required: false
+      max_keys:
+        type: integer
+        description: Maximum number of objects to return (default 100, max 500).
+        required: false
+
+  s3_preview:
+    description: >
+      Sample rows and infer the schema of an S3 data file.
+      Works with CSV, TSV, and JSON files without additional layers.
+      Parquet requires the pyarrow layer.
+    parameters:
+      source:
+        type: string
+        description: Institutional source label (from s3_browse).
+        required: true
+      key:
+        type: string
+        description: S3 object key relative to the source prefix (from s3_browse).
+        required: true
+      format:
+        type: string
+        description: >
+          File format: csv, tsv, json, parquet. Inferred from key extension if omitted.
+        required: false
+      max_rows:
+        type: integer
+        description: Rows to include in sample (default 5, max 20).
+        required: false
+
+  s3_load:
+    description: >
+      Register an institutional S3 path as a Quick Sight data source.
+      Creates a manifest and data source — the data stays in S3.
+      Only CSV, TSV, Parquet, and JSON can be directly ingested;
+      other formats require the compute layer for conversion.
+    parameters:
+      source:
+        type: string
+        description: Institutional source label (from s3_browse).
+        required: true
+      prefix:
+        type: string
+        description: >
+          S3 key prefix within source to load. Defaults to the source root.
+        required: false
+      format:
+        type: string
+        description: File format (csv, tsv, parquet, json). Inferred if omitted.
+        required: false
+      dataset_name:
+        type: string
+        description: >
+          Name for the Quick Sight dataset. Defaults to "{source} / {prefix}".
+        required: false
+      sample_only:
+        type: boolean
+        description: >
+          If true, only load the first 10 files. Use for large datasets to test
+          before loading everything.
+        required: false

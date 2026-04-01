@@ -1,0 +1,397 @@
+"""
+Quick Suite Open Data — CDK Stack
+
+Deploys RODA public dataset tools and institutional S3 browser tools
+as AgentCore Gateway Lambda targets.
+
+Resources:
+  - DynamoDB: RODA catalog (slug PK, by-primary-tag GSI)
+  - S3: manifest storage bucket (7-day lifecycle)
+  - Lambda: catalog-sync, roda-search, roda-load, s3-browse, s3-preview, s3-load
+  - Lambda Layer: shared data utilities
+  - EventBridge: daily catalog sync rule
+  - SNS: optional real-time RODA update subscription
+  - IAM: Quick Sight create/describe, S3 read on configured buckets
+  - CfnOutputs: Lambda ARNs for AgentCore Gateway target registration
+
+AgentCore Integration:
+  After deployment, register each tool Lambda as an AgentCore Gateway
+  Lambda target. The Gateway invokes Lambdas directly — no API Gateway needed.
+  See README.md for step-by-step registration.
+"""
+
+import json
+from pathlib import Path
+
+from aws_cdk import (
+    CfnOutput,
+    Duration,
+    RemovalPolicy,
+    Stack,
+)
+from aws_cdk import (
+    aws_dynamodb as dynamodb,
+)
+from aws_cdk import (
+    aws_events as events,
+)
+from aws_cdk import (
+    aws_events_targets as targets,
+)
+from aws_cdk import (
+    aws_iam as iam,
+)
+from aws_cdk import (
+    aws_lambda as lambda_,
+)
+from aws_cdk import (
+    aws_s3 as s3,
+)
+from aws_cdk import (
+    aws_sns as sns,
+)
+from aws_cdk import (
+    aws_sns_subscriptions as sns_subscriptions,
+)
+from constructs import Construct
+
+try:
+    import yaml
+    def _load_yaml(path):
+        with open(path) as f:
+            return yaml.safe_load(f)
+except ImportError:
+    def _load_yaml(path):
+        raise RuntimeError("pyyaml required — run: pip install pyyaml")
+
+
+class OpenDataStack(Stack):
+    def __init__(self, scope: Construct, id: str, **kwargs) -> None:
+        super().__init__(scope, id, **kwargs)
+
+        prefix = "qs-open-data"
+
+        account_id = self.account
+        qs_region = self.node.try_get_context("quicksight_region") or self.region
+        qs_user = self.node.try_get_context("quicksight_user") or "Admin"
+        enable_realtime_sync = bool(self.node.try_get_context("enable_realtime_sync"))
+        manifest_bucket_name = self.node.try_get_context("manifest_bucket_name")
+
+        # Load institutional sources config if present
+        sources_path = Path(__file__).parent.parent / "config" / "sources.yaml"
+        if not sources_path.exists():
+            sources_path = Path(__file__).parent.parent / "config" / "sources.example.yaml"
+        institutional_sources = []
+        if sources_path.exists():
+            config = _load_yaml(str(sources_path))
+            institutional_sources = config.get("institutional_sources", [])
+
+        # -----------------------------------------------------------------
+        # DynamoDB: RODA Catalog
+        # -----------------------------------------------------------------
+        catalog_table = dynamodb.Table(
+            self,
+            "RodaCatalog",
+            table_name=f"{prefix}-roda-catalog",
+            partition_key=dynamodb.Attribute(
+                name="slug", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        catalog_table.add_global_secondary_index(
+            index_name="by-primary-tag",
+            partition_key=dynamodb.Attribute(
+                name="primaryTag", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="name", type=dynamodb.AttributeType.STRING
+            ),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+
+        # -----------------------------------------------------------------
+        # S3: Manifest Bucket
+        # -----------------------------------------------------------------
+        manifest_bucket = s3.Bucket(
+            self,
+            "ManifestBucket",
+            bucket_name=manifest_bucket_name,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+            lifecycle_rules=[
+                s3.LifecycleRule(expiration=Duration.days(7))
+            ],
+        )
+
+        # -----------------------------------------------------------------
+        # Shared Lambda Layer (data_utils.py)
+        # -----------------------------------------------------------------
+        common_layer = lambda_.LayerVersion(
+            self,
+            "CommonLayer",
+            code=lambda_.Code.from_asset("lambdas/common"),
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_12],
+            description="Shared data utilities (detect_formats, schema inference)",
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: Catalog Sync (EventBridge — not an AgentCore tool)
+        # -----------------------------------------------------------------
+        sync_fn = lambda_.Function(
+            self,
+            "CatalogSync",
+            function_name=f"{prefix}-catalog-sync",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/catalog-sync"),
+            layers=[common_layer],
+            timeout=Duration.minutes(5),
+            memory_size=512,
+            environment={
+                "TABLE_NAME": catalog_table.table_name,
+                "RODA_BUCKET": "registry.opendata.aws",
+                "RODA_PREFIX": "roda/ndjson/",
+            },
+        )
+        catalog_table.grant_write_data(sync_fn)
+        sync_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:ListBucket"],
+                resources=[
+                    "arn:aws:s3:::registry.opendata.aws",
+                    "arn:aws:s3:::registry.opendata.aws/*",
+                ],
+            )
+        )
+
+        events.Rule(
+            self,
+            "DailySyncRule",
+            schedule=events.Schedule.rate(Duration.days(1)),
+            targets=[targets.LambdaFunction(sync_fn)],
+        )
+
+        if enable_realtime_sync:
+            roda_topic = sns.Topic.from_topic_arn(
+                self, "RodaTopic",
+                "arn:aws:sns:us-east-1:652627389412:roda-object_created",
+            )
+            roda_topic.add_subscription(
+                sns_subscriptions.LambdaSubscription(sync_fn)
+            )
+
+        # -----------------------------------------------------------------
+        # Lambda: RODA Search (AgentCore tool: roda_search)
+        # -----------------------------------------------------------------
+        search_fn = lambda_.Function(
+            self,
+            "RodaSearch",
+            function_name=f"{prefix}-roda-search",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/roda-search"),
+            layers=[common_layer],
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            environment={
+                "TABLE_NAME": catalog_table.table_name,
+            },
+        )
+        catalog_table.grant_read_data(search_fn)
+
+        # -----------------------------------------------------------------
+        # Lambda: RODA Load (AgentCore tool: roda_load)
+        # -----------------------------------------------------------------
+        loader_fn = lambda_.Function(
+            self,
+            "RodaLoader",
+            function_name=f"{prefix}-roda-load",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/dataset-loader"),
+            layers=[common_layer],
+            timeout=Duration.minutes(2),
+            memory_size=256,
+            environment={
+                "TABLE_NAME": catalog_table.table_name,
+                "MANIFEST_BUCKET": manifest_bucket.bucket_name,
+                "QUICKSIGHT_ACCOUNT_ID": account_id,
+                "QUICKSIGHT_REGION": qs_region,
+                "QUICKSIGHT_USER": qs_user,
+            },
+        )
+        catalog_table.grant_read_data(loader_fn)
+        manifest_bucket.grant_read_write(loader_fn)
+        loader_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "quicksight:CreateDataSource",
+                    "quicksight:CreateDataSet",
+                    "quicksight:DescribeDataSource",
+                    "quicksight:DescribeDataSet",
+                    "quicksight:UpdateDataSource",
+                    "quicksight:PassDataSource",
+                ],
+                resources=[f"arn:aws:quicksight:{qs_region}:{account_id}:*"],
+            )
+        )
+        # Read from public RODA buckets
+        loader_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:ListBucket"],
+                resources=["arn:aws:s3:::*"],
+            )
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: S3 Browse (AgentCore tool: s3_browse)
+        # -----------------------------------------------------------------
+        s3_browse_env = {
+            "SOURCES_CONFIG": json.dumps(
+                [{"label": s["label"], "bucket": s["bucket"],
+                  "prefix": s.get("prefix", ""),
+                  "description": s.get("description", "")}
+                 for s in institutional_sources]
+            ),
+        }
+
+        browse_fn = lambda_.Function(
+            self,
+            "S3Browse",
+            function_name=f"{prefix}-s3-browse",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/s3-browse"),
+            layers=[common_layer],
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            environment=s3_browse_env,
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: S3 Preview (AgentCore tool: s3_preview)
+        # -----------------------------------------------------------------
+        preview_fn = lambda_.Function(
+            self,
+            "S3Preview",
+            function_name=f"{prefix}-s3-preview",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/s3-preview"),
+            layers=[common_layer],
+            timeout=Duration.seconds(30),
+            memory_size=512,
+            environment=s3_browse_env,
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: S3 Load (AgentCore tool: s3_load)
+        # -----------------------------------------------------------------
+        s3_load_fn = lambda_.Function(
+            self,
+            "S3Load",
+            function_name=f"{prefix}-s3-load",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/s3-load"),
+            layers=[common_layer],
+            timeout=Duration.minutes(2),
+            memory_size=256,
+            environment={
+                **s3_browse_env,
+                "MANIFEST_BUCKET": manifest_bucket.bucket_name,
+                "QUICKSIGHT_ACCOUNT_ID": account_id,
+                "QUICKSIGHT_REGION": qs_region,
+                "QUICKSIGHT_USER": qs_user,
+            },
+        )
+        manifest_bucket.grant_read_write(s3_load_fn)
+        s3_load_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "quicksight:CreateDataSource",
+                    "quicksight:CreateDataSet",
+                    "quicksight:DescribeDataSource",
+                    "quicksight:PassDataSource",
+                ],
+                resources=[f"arn:aws:quicksight:{qs_region}:{account_id}:*"],
+            )
+        )
+
+        # S3 read permissions: configured institutional buckets only
+        tool_fns = [browse_fn, preview_fn, s3_load_fn]
+        if institutional_sources:
+            allowed_arns = []
+            for src in institutional_sources:
+                bucket = src["bucket"]
+                pfx = src.get("prefix", "")
+                allowed_arns.extend([
+                    f"arn:aws:s3:::{bucket}",
+                    f"arn:aws:s3:::{bucket}/{pfx}*" if pfx else f"arn:aws:s3:::{bucket}/*",
+                ])
+            for fn in tool_fns:
+                fn.add_to_role_policy(
+                    iam.PolicyStatement(
+                        actions=["s3:GetObject", "s3:ListBucket"],
+                        resources=allowed_arns,
+                    )
+                )
+        else:
+            # No sources configured — grant no S3 access (tools will report misconfiguration)
+            pass
+
+        # -----------------------------------------------------------------
+        # AgentCore Gateway permission
+        # Allow the AgentCore Gateway execution role to invoke tool Lambdas.
+        # Set agentcore_gateway_role_arn context or add manually post-deploy.
+        # -----------------------------------------------------------------
+        gateway_role_arn = self.node.try_get_context("agentcore_gateway_role_arn")
+        if gateway_role_arn:
+            for fn in [search_fn, loader_fn, browse_fn, preview_fn, s3_load_fn]:
+                fn.add_permission(
+                    "AgentCoreInvoke",
+                    principal=iam.ArnPrincipal(gateway_role_arn),
+                    action="lambda:InvokeFunction",
+                )
+
+        # -----------------------------------------------------------------
+        # Outputs — Lambda ARNs for AgentCore Gateway target registration
+        # -----------------------------------------------------------------
+        tool_arns = {
+            "roda_search": search_fn.function_arn,
+            "roda_load": loader_fn.function_arn,
+            "s3_browse": browse_fn.function_arn,
+            "s3_preview": preview_fn.function_arn,
+            "s3_load": s3_load_fn.function_arn,
+        }
+
+        for tool_name, arn_value in tool_arns.items():
+            CfnOutput(
+                self,
+                f"{tool_name.title().replace('_', '')}Arn",
+                value=arn_value,
+                description=f"Register as AgentCore Gateway Lambda target: {tool_name}",
+                export_name=f"qs-open-data-{tool_name.replace('_', '-')}-arn",
+            )
+
+        CfnOutput(
+            self,
+            "CatalogTableName",
+            value=catalog_table.table_name,
+        )
+
+        CfnOutput(
+            self,
+            "ManifestBucketName",
+            value=manifest_bucket.bucket_name,
+        )
+
+        # Convenience: all tool ARNs as a single JSON output
+        CfnOutput(
+            self,
+            "ToolArns",
+            value=json.dumps(tool_arns),
+            description="All tool Lambda ARNs — register each as AgentCore Gateway Lambda target",
+        )

@@ -1,0 +1,33 @@
+# Institutional S3 Data Sources Configuration
+#
+# Copy this file to config/sources.yaml and customize for your institution.
+# These are the ONLY S3 buckets the s3_browse, s3_preview, and s3_load tools
+# can access. The IAM policy is generated from this list at deploy time.
+#
+# Redeploy (cdk deploy) after changing this file.
+
+institutional_sources:
+  - label: "Shared Research Data"
+    bucket: university-research-data
+    prefix: shared/
+    description: "Cross-departmental research datasets from the research computing office"
+
+  - label: "Enrollment Analytics"
+    bucket: enrollment-analytics-prod
+    prefix: ""
+    description: "Institutional research office enrollment, retention, and graduation data"
+
+  - label: "Financial Aid"
+    bucket: financial-aid-analytics
+    prefix: reports/
+    description: "Financial aid disbursement and packaging summary reports"
+
+  - label: "Student Success"
+    bucket: student-success-data
+    prefix: cohorts/
+    description: "Early alert, advising, and student success intervention data"
+
+  - label: "Research Grants"
+    bucket: sponsored-research-data
+    prefix: expenditures/
+    description: "Sponsored research expenditure and overhead recovery data"
