@@ -33,6 +33,9 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
 )
 from aws_cdk import (
+    aws_cloudwatch as cw,
+)
+from aws_cdk import (
     aws_events as events,
 )
 from aws_cdk import (
@@ -52,6 +55,9 @@ from aws_cdk import (
 )
 from aws_cdk import (
     aws_sns_subscriptions as sns_subscriptions,
+)
+from aws_cdk import (
+    aws_ssm as ssm,
 )
 from constructs import Construct
 
@@ -121,6 +127,17 @@ class OpenDataStack(Stack):
                 name="name", type=dynamodb.AttributeType.STRING
             ),
             projection_type=dynamodb.ProjectionType.ALL,
+        )
+
+        claws_lookup_table = dynamodb.Table(
+            self,
+            "ClawsLookupTable",
+            table_name=f"{prefix}-claws-lookup",
+            partition_key=dynamodb.Attribute(
+                name="source_id", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
         )
 
         # -----------------------------------------------------------------
@@ -244,9 +261,11 @@ class OpenDataStack(Stack):
                 "QUICKSIGHT_ACCOUNT_ID": account_id,
                 "QUICKSIGHT_REGION": qs_region,
                 "QUICKSIGHT_USER": qs_user,
+                "CLAWS_LOOKUP_TABLE": claws_lookup_table.table_name,
             },
         )
         catalog_table.grant_read_data(loader_fn)
+        claws_lookup_table.grant_write_data(loader_fn)
         manifest_bucket.grant_read_write(loader_fn)
         loader_fn.add_to_role_policy(
             iam.PolicyStatement(
@@ -329,9 +348,11 @@ class OpenDataStack(Stack):
                 "QUICKSIGHT_ACCOUNT_ID": account_id,
                 "QUICKSIGHT_REGION": qs_region,
                 "QUICKSIGHT_USER": qs_user,
+                "CLAWS_LOOKUP_TABLE": claws_lookup_table.table_name,
             },
         )
         manifest_bucket.grant_read_write(s3_load_fn)
+        claws_lookup_table.grant_write_data(s3_load_fn)
         s3_load_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=[
@@ -365,6 +386,99 @@ class OpenDataStack(Stack):
         else:
             # No sources configured — grant no S3 access (tools will report misconfiguration)
             pass
+
+        # -----------------------------------------------------------------
+        # Lambda: clAWS Resolver (internal — not an AgentCore tool)
+        # -----------------------------------------------------------------
+        claws_resolver_fn = lambda_.Function(
+            self,
+            "ClawsResolver",
+            function_name=f"{prefix}-claws-resolver",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/claws-resolver"),
+            timeout=Duration.seconds(10),
+            memory_size=128,
+            environment={
+                "CLAWS_LOOKUP_TABLE": claws_lookup_table.table_name,
+            },
+        )
+        claws_lookup_table.grant_read_data(claws_resolver_fn)
+
+        CfnOutput(
+            self,
+            "ClawsResolverArn",
+            value=claws_resolver_fn.function_arn,
+            description="clAWS resolver Lambda ARN — used by compute extract Lambda",
+            export_name="qs-open-data-claws-resolver-arn",
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: Catalog Quality Check (EventBridge weekly — not an AgentCore tool)
+        # -----------------------------------------------------------------
+        quality_check_fn = lambda_.Function(
+            self,
+            "CatalogQualityCheck",
+            function_name=f"{prefix}-catalog-quality-check",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/catalog-quality-check"),
+            timeout=Duration.minutes(5),
+            memory_size=256,
+            environment={
+                "TABLE_NAME": catalog_table.table_name,
+            },
+        )
+        catalog_table.grant_read_write_data(quality_check_fn)
+        quality_check_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+            )
+        )
+
+        events.Rule(
+            self,
+            "WeeklyQualityCheckRule",
+            schedule=events.Schedule.rate(Duration.days(7)),
+            targets=[targets.LambdaFunction(quality_check_fn)],
+        )
+
+        stale_alarm = cw.Alarm(
+            self,
+            "StaleDatasetAlarm",
+            alarm_name=f"{prefix}-stale-datasets",
+            alarm_description="More than 10 stale datasets detected in the RODA catalog",
+            metric=cw.Metric(
+                namespace="QuickSuiteOpenData",
+                metric_name="StaleDatasets",
+                period=Duration.days(7),
+                statistic="Sum",
+            ),
+            threshold=10,
+            evaluation_periods=1,
+            comparison_operator=cw.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+        )
+
+        # -----------------------------------------------------------------
+        # SSM exports for qs-discover unified discovery Lambda
+        # Written at deploy time so shared/ stack can read without CFN dep.
+        # -----------------------------------------------------------------
+        ssm.StringParameter(
+            self,
+            "RodaSearchArnParam",
+            parameter_name="/quick-suite/lambdas/roda-search-arn",
+            string_value=search_fn.function_arn,
+            description="roda-search Lambda ARN for qs-discover fan-out",
+        )
+        ssm.StringParameter(
+            self,
+            "S3BrowseArnParam",
+            parameter_name="/quick-suite/lambdas/s3-browse-arn",
+            string_value=browse_fn.function_arn,
+            description="s3-browse Lambda ARN for qs-discover fan-out",
+        )
 
         # -----------------------------------------------------------------
         # AgentCore Gateway permission
