@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-04-02
+
+### Fixed
+- `lambdas/s3-preview/handler.py`: accept full S3 keys (as returned by `s3_browse`) without re-prepending the source prefix; fixes 404 on `HeadObject` when the key already includes the prefix
+- `lambdas/pyarrow-layer/Dockerfile`: change pip `--target` from `/asset-output/python` to `/asset/python` so `Code.from_docker_build()` can locate the output at CDK's expected `/asset` path
+- CI `test` job: add `setup-node@v4` and `npm install -g aws-cdk` so `cdk synth` succeeds
+- Lint: fix I001 import-sort order in `stacks/open_data_stack.py`; remove unused `stale_alarm` variable, unused `Key` import, and unused `result` assignment in tests
+
 ## [0.4.2] - 2026-04-01
 
 ### Fixed
