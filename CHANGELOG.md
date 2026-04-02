@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-02
+
+### Added
+- ClawsLookupTable writes: `roda_load` writes `roda-{slug}` → `dataset_id`; `s3_load` writes `s3-{label}` → `data_source_id` for downstream clAWS handoff; `claws_source_id` field in both responses
+- `exclude_deprecated` boolean filter in `roda_search`: when true, omits datasets with `deprecated=True` from results
+- S3 reachability probing in `catalog-quality-check`: anonymous `head_bucket` call per `s3Resources` ARN; unreachable buckets flagged `unreachable=True`; `UnreachableDatasets` CloudWatch metric emitted alongside `StaleDatasets`
+- `roda_sns_arn` CDK context variable overrides the default RODA SNS topic ARN (removes us-east-1 hardcoding)
+- SSM parameters `/quick-suite/roda-search-arn` and `/quick-suite/s3-browse-arn` exported for cross-stack discovery by `qs-discover`
+
+### Fixed
+- `catalog-sync` Lambda: `last_updated` epoch timestamp now written on every upsert (previously missing on update path)
+
 ## [0.4.3] - 2026-04-02
 
 ### Fixed
@@ -69,7 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared `data_utils` Lambda layer for format detection and schema inference
 - CDK stack with AgentCore Gateway Lambda target wiring and IAM policies scoped to configured sources
 
-[unreleased]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.4.2...HEAD
+[unreleased]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.4.3...v0.5.0
 [0.4.2]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.3.0...v0.4.0
