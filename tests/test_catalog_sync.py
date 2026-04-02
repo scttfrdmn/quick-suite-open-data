@@ -5,12 +5,11 @@ Tests transform_dataset(), derive_slug(), detect_formats(), handle_full_sync(),
 and handle_sns_update() using MagicMock — no real AWS calls.
 """
 
+import importlib.util
 import json
 import os
 import sys
-import importlib.util
-import pytest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 

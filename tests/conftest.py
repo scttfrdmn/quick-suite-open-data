@@ -3,13 +3,11 @@ Shared fixtures for quick-suite-open-data tests.
 """
 
 import os
-import sys
 import subprocess
+import sys
 import time
-import importlib
-import json
+
 import pytest
-from unittest.mock import MagicMock, patch
 
 # Fake AWS credentials before any boto3 import
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")

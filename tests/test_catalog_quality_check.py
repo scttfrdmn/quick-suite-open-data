@@ -5,12 +5,9 @@ Tests stale detection logic using Substrate stubs — no real AWS calls.
 """
 
 import importlib.util
-import json
 import os
 import sys
 import time
-
-import pytest
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 
@@ -173,7 +170,7 @@ class TestCatalogQualityCheck:
         items = [{"slug": "stale-one"}, {"slug": "stale-two"}]
         mod, table, cw = _make_handler(items)
 
-        result = mod.handler({}, None)
+        mod.handler({}, None)
 
         assert len(cw.calls) == 1
         call = cw.calls[0]
@@ -217,6 +214,7 @@ class TestS3Reachability:
     def test_missing_s3_bucket_marked_unreachable(self):
         """head_bucket returns 404 → item flagged unreachable, count = 1."""
         import unittest.mock as mock
+
         from botocore.exceptions import ClientError
 
         items = [self._make_s3_item("missing-bucket-dataset", "nonexistent-roda-bucket")]

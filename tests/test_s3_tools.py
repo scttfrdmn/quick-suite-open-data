@@ -8,7 +8,6 @@ Unit tests use MagicMock for all AWS clients.
 Integration tests (marked) route QuickSight calls through Substrate.
 """
 
-import boto3
 import importlib
 import importlib.util
 import json
@@ -17,6 +16,7 @@ import sys
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import boto3
 import pytest
 
 # Ensure data_utils (common layer) is importable for s3-preview

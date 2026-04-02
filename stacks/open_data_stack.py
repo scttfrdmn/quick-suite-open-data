@@ -30,10 +30,10 @@ from aws_cdk import (
     Stack,
 )
 from aws_cdk import (
-    aws_dynamodb as dynamodb,
+    aws_cloudwatch as cw,
 )
 from aws_cdk import (
-    aws_cloudwatch as cw,
+    aws_dynamodb as dynamodb,
 )
 from aws_cdk import (
     aws_events as events,
@@ -445,7 +445,7 @@ class OpenDataStack(Stack):
             targets=[targets.LambdaFunction(quality_check_fn)],
         )
 
-        stale_alarm = cw.Alarm(
+        cw.Alarm(
             self,
             "StaleDatasetAlarm",
             alarm_name=f"{prefix}-stale-datasets",

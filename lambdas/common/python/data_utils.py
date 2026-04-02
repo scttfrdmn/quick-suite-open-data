@@ -144,6 +144,7 @@ def infer_schema_from_parquet(content: bytes) -> dict:
     """Infer schema and sample rows from Parquet bytes. Requires pyarrow layer."""
     try:
         import io
+
         import pyarrow.parquet as pq
         table = pq.read_table(io.BytesIO(content))
         schema = table.schema
