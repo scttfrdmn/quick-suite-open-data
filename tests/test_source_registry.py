@@ -1,7 +1,7 @@
 """
-Unit tests for register-source/handler.py.
+Integration tests for register-source/handler.py.
 
-Uses moto to mock DynamoDB.
+Uses Substrate (real AWS emulator) for DynamoDB — never moto.
 """
 
 import importlib
@@ -11,52 +11,42 @@ import sys
 
 import boto3
 import pytest
-from moto import mock_aws
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 _TABLE_NAME = "qs-data-source-registry-test"
 
 
-def _load(table_name=_TABLE_NAME):
-    """Load register-source/handler.py as a unique module."""
-    env_patch = {"SOURCE_REGISTRY_TABLE": table_name}
-    with __import__("unittest.mock", fromlist=["patch"]).patch.dict(os.environ, env_patch):
+class TestRegisterSource:
+    """Substrate-backed integration tests for the register-source Lambda."""
+
+    def _create_table(self, substrate_url):
+        ddb = boto3.client("dynamodb", endpoint_url=substrate_url, region_name="us-east-1")
+        ddb.create_table(
+            TableName=_TABLE_NAME,
+            KeySchema=[{"AttributeName": "source_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "source_id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb.get_waiter("table_exists").wait(TableName=_TABLE_NAME)
+        return boto3.resource("dynamodb", endpoint_url=substrate_url, region_name="us-east-1")
+
+    def _reload(self, substrate_url, monkeypatch):
+        monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+        monkeypatch.setenv("SOURCE_REGISTRY_TABLE", _TABLE_NAME)
         path = os.path.join(REPO_ROOT, "lambdas", "register-source", "handler.py")
-        alias = f"_register_source_{table_name}"
+        alias = "_register_source_integ"
         spec = importlib.util.spec_from_file_location(alias, path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[alias] = mod
         spec.loader.exec_module(mod)
         return mod
 
+    @pytest.mark.integration
+    def test_happy_path_valid_registration(self, substrate_url, reset_substrate, monkeypatch):
+        resource = self._create_table(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
 
-def _create_table(ddb_client):
-    ddb_client.create_table(
-        TableName=_TABLE_NAME,
-        KeySchema=[{"AttributeName": "source_id", "KeyType": "HASH"}],
-        AttributeDefinitions=[{"AttributeName": "source_id", "AttributeType": "S"}],
-        BillingMode="PAY_PER_REQUEST",
-    )
-    waiter = ddb_client.get_waiter("table_exists")
-    waiter.wait(TableName=_TABLE_NAME)
-
-
-class TestRegisterSource:
-    @pytest.fixture(autouse=True)
-    def setup_moto(self):
-        with mock_aws():
-            self.ddb = boto3.client("dynamodb", region_name="us-east-1")
-            _create_table(self.ddb)
-            self.resource = boto3.resource("dynamodb", region_name="us-east-1")
-            self.mod = _load(_TABLE_NAME)
-            self.mod.dynamodb = self.resource
-            yield
-
-    def _call(self, event):
-        return self.mod.handler(event, None)
-
-    def test_happy_path_valid_registration(self):
-        result = self._call({
+        result = mod.handler({
             "source_id": "s3-test-bucket",
             "type": "s3",
             "connection_config": {"bucket": "my-bucket", "prefix": "data/"},
@@ -64,98 +54,122 @@ class TestRegisterSource:
             "description": "A test S3 bucket",
             "tags": ["research", "test"],
             "data_classification": "internal",
-        })
+        }, None)
+
         assert result["status"] == "registered"
         assert result["source_id"] == "s3-test-bucket"
 
-        # Verify item written to DDB
-        table = self.resource.Table(_TABLE_NAME)
-        item = table.get_item(Key={"source_id": "s3-test-bucket"}).get("Item")
+        item = resource.Table(_TABLE_NAME).get_item(Key={"source_id": "s3-test-bucket"}).get("Item")
         assert item is not None
         assert item["type"] == "s3"
         assert item["display_name"] == "Test Bucket"
         assert "registered_at" in item
 
-    def test_missing_required_field_returns_error(self):
-        result = self._call({
+    @pytest.mark.integration
+    def test_missing_required_field_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        self._create_table(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
+        result = mod.handler({
             "source_id": "partial-source",
             "type": "s3",
             # missing connection_config, display_name, description, data_classification
-        })
+        }, None)
+
         assert "error" in result
         assert "Missing required fields" in result["error"]
 
-    def test_invalid_type_returns_error(self):
-        result = self._call({
+    @pytest.mark.integration
+    def test_invalid_type_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        self._create_table(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
+        result = mod.handler({
             "source_id": "bad-type-source",
             "type": "mysql",
             "connection_config": "some-arn",
             "display_name": "Bad Type",
             "description": "Invalid type",
             "data_classification": "public",
-        })
+        }, None)
+
         assert "error" in result
         assert "Invalid type" in result["error"]
 
-    def test_invalid_data_classification_returns_error(self):
-        result = self._call({
+    @pytest.mark.integration
+    def test_invalid_data_classification_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        self._create_table(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
+        result = mod.handler({
             "source_id": "bad-class-source",
             "type": "s3",
             "connection_config": "some-arn",
             "display_name": "Bad Class",
             "description": "Invalid classification",
             "data_classification": "confidential",
-        })
+        }, None)
+
         assert "error" in result
         assert "Invalid data_classification" in result["error"]
 
-    def test_reregistration_updates_item(self):
-        # Register once
-        self._call({
+    @pytest.mark.integration
+    def test_reregistration_updates_item(self, substrate_url, reset_substrate, monkeypatch):
+        resource = self._create_table(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
+        mod.handler({
             "source_id": "reregister-source",
             "type": "s3",
             "connection_config": "config-v1",
             "display_name": "Old Name",
             "description": "Original description",
             "data_classification": "public",
-        })
-        # Register again with updated name
-        result = self._call({
+        }, None)
+
+        result = mod.handler({
             "source_id": "reregister-source",
             "type": "snowflake",
             "connection_config": "arn:aws:secretsmanager:us-east-1:123:secret:sf",
             "display_name": "New Name",
             "description": "Updated description",
             "data_classification": "restricted",
-        })
-        assert result["status"] == "registered"
+        }, None)
 
-        table = self.resource.Table(_TABLE_NAME)
-        item = table.get_item(Key={"source_id": "reregister-source"}).get("Item")
+        assert result["status"] == "registered"
+        item = resource.Table(_TABLE_NAME).get_item(Key={"source_id": "reregister-source"}).get("Item")
         assert item["display_name"] == "New Name"
         assert item["type"] == "snowflake"
         assert item["data_classification"] == "restricted"
 
-    def test_all_valid_types_accepted(self):
+    @pytest.mark.integration
+    def test_all_valid_types_accepted(self, substrate_url, reset_substrate, monkeypatch):
+        self._create_table(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
         for source_type in ["s3", "snowflake", "redshift", "roda"]:
-            result = self._call({
+            result = mod.handler({
                 "source_id": f"test-{source_type}",
                 "type": source_type,
                 "connection_config": "config",
                 "display_name": f"Test {source_type}",
                 "description": "Description",
                 "data_classification": "public",
-            })
+            }, None)
             assert result["status"] == "registered", f"Failed for type={source_type}: {result}"
 
-    def test_all_valid_classifications_accepted(self):
+    @pytest.mark.integration
+    def test_all_valid_classifications_accepted(self, substrate_url, reset_substrate, monkeypatch):
+        self._create_table(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
         for i, cls in enumerate(["public", "internal", "restricted", "phi"]):
-            result = self._call({
+            result = mod.handler({
                 "source_id": f"test-cls-{i}",
                 "type": "s3",
                 "connection_config": "config",
                 "display_name": f"Test {cls}",
                 "description": "Description",
                 "data_classification": cls,
-            })
+            }, None)
             assert result["status"] == "registered", f"Failed for classification={cls}: {result}"

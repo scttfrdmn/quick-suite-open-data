@@ -78,16 +78,18 @@ def handler(event: dict, context: Any) -> dict:
 
     registered_at = datetime.now(timezone.utc).isoformat()
 
+    normalized_tags = tags if isinstance(tags, list) else []
     item = {
         "source_id": source_id,
         "type": source_type,
         "connection_config": connection_config_str,
         "display_name": display_name,
         "description": description,
-        "tags": tags if isinstance(tags, list) else [],
         "data_classification": data_classification,
         "registered_at": registered_at,
     }
+    if normalized_tags:
+        item["tags"] = normalized_tags
 
     try:
         table = dynamodb.Table(TABLE_NAME)
