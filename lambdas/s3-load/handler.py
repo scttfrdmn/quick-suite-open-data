@@ -36,6 +36,9 @@ except json.JSONDecodeError as e:
 MANIFEST_BUCKET = os.environ['MANIFEST_BUCKET']
 QS_ACCOUNT_ID = os.environ['QUICKSIGHT_ACCOUNT_ID']
 QS_REGION = os.environ.get('QUICKSIGHT_REGION', 'us-east-1')
+CLAWS_LOOKUP_TABLE = os.environ.get('CLAWS_LOOKUP_TABLE', '')
+
+dynamodb = boto3.resource('dynamodb')
 
 QS_DIRECT_FORMATS = {'csv', 'tsv', 'parquet', 'json'}
 MAX_MANIFEST_FILES = 200
@@ -157,6 +160,16 @@ def handler(event: dict, context: Any) -> dict:
             'fileCount': len(files),
         }
 
+    claws_source_id = f's3-{re.sub(r"[^a-z0-9-]", "-", source_label.lower())}'
+    if CLAWS_LOOKUP_TABLE:
+        try:
+            dynamodb.Table(CLAWS_LOOKUP_TABLE).put_item(Item={
+                'source_id': claws_source_id,
+                'dataset_id': ds_id,
+            })
+        except Exception as exc:
+            logger.warning(json.dumps({'claws_lookup_write_failed': str(exc)}))
+
     return {
         'status': 'loaded',
         'datasetId': ds_id,
@@ -168,7 +181,7 @@ def handler(event: dict, context: Any) -> dict:
         'format': fmt,
         'manifestUri': f's3://{MANIFEST_BUCKET}/{manifest_key}',
         'quicksightResult': qs_result,
-        'claws_source_id': f's3-{re.sub(r"[^a-z0-9-]", "-", source_label.lower())}',
+        'claws_source_id': claws_source_id,
     }
 
 

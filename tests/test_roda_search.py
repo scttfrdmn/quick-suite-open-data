@@ -217,6 +217,43 @@ class TestProjectResult:
         assert len(result["datasets"][0]["description"]) <= 400
 
 
+class TestDeprecatedDatasets:
+    """OD-15: deprecated flag in project_result + exclude_deprecated filter."""
+
+    DEPRECATED_ITEM = {
+        **CLIMATE_ITEM,
+        "slug": "old-climate",
+        "deprecated": True,
+    }
+
+    def test_deprecated_flag_in_result(self):
+        table = _make_table(scan_items=[self.DEPRECATED_ITEM])
+        with _patch_table(table):
+            result = roda_search.handler({}, None)
+        assert result["datasets"][0]["deprecated"] is True
+
+    def test_non_deprecated_flag_false_in_result(self):
+        table = _make_table(scan_items=[CLIMATE_ITEM])
+        with _patch_table(table):
+            result = roda_search.handler({}, None)
+        assert result["datasets"][0]["deprecated"] is False
+
+    def test_exclude_deprecated_removes_items(self):
+        table = _make_table(scan_items=[CLIMATE_ITEM, self.DEPRECATED_ITEM])
+        with _patch_table(table):
+            result = roda_search.handler({"exclude_deprecated": True}, None)
+        slugs = [d["slug"] for d in result["datasets"]]
+        assert "old-climate" not in slugs
+        assert "noaa-climate" in slugs
+
+    def test_exclude_deprecated_false_keeps_deprecated_items(self):
+        table = _make_table(scan_items=[CLIMATE_ITEM, self.DEPRECATED_ITEM])
+        with _patch_table(table):
+            result = roda_search.handler({"exclude_deprecated": False}, None)
+        slugs = [d["slug"] for d in result["datasets"]]
+        assert "old-climate" in slugs
+
+
 class TestDynamoDBErrors:
     def test_scan_exception_returns_empty(self):
         table = MagicMock()

@@ -84,6 +84,8 @@ def handler(event: dict, context: Any) -> dict:
         return {'count': 0, 'datasets': [], 'query': '', 'appliedTags': [], 'appliedFormat': '',
                 'error': "'max_results' must be between 1 and 50"}
     qs_only = event.get('quicksight_compatible', False)
+    _raw_excl = event.get('exclude_deprecated', False)
+    exclude_deprecated = _raw_excl.lower() in ("true", "1", "yes") if isinstance(_raw_excl, str) else bool(_raw_excl)
 
     # Decode pagination token
     pagination_token = str(event.get('pagination_token') or '').strip()
@@ -146,6 +148,10 @@ def handler(event: dict, context: Any) -> dict:
             r for r in results
             if qs_formats.intersection(set(r.get('formats', [])))
         ]
+
+    # Deprecated filter
+    if exclude_deprecated:
+        results = [r for r in results if not r.get('deprecated', False)]
 
     results = results[:max_results]
     projected = [project_result(r) for r in results]
@@ -364,4 +370,5 @@ def project_result(item: dict) -> dict:
             )
         ),
         'documentation': item.get('documentation', ''),
+        'deprecated': bool(item.get('deprecated', False)),
     }

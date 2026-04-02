@@ -8,6 +8,7 @@ Unit tests use MagicMock for all AWS clients.
 Integration tests (marked) route QuickSight calls through Substrate.
 """
 
+import boto3
 import importlib
 import importlib.util
 import json
@@ -446,3 +447,146 @@ class TestS3LoadMultiPrefix:
             )
         assert result["status"] == "loaded"
         assert result["prefixCount"] == 1
+
+
+# ===========================================================================
+# s3_load — ClawsLookupTable persistence (OD-17)
+# ===========================================================================
+
+class TestS3LoadClawsLookup:
+    """After successful QS creation, claws_source_id is written to ClawsLookupTable."""
+
+    def test_claws_lookup_write_called_on_success(self):
+        mock_s3 = _make_s3_paginator(keys=["datasets/2023.csv"])
+        mock_qs = _mock_qs_s3load()
+        mock_ddb_table = MagicMock()
+        mock_ddb = MagicMock()
+        mock_ddb.Table.return_value = mock_ddb_table
+
+        with patch.object(_s3_load, "_sources", SOURCES), \
+             patch.object(_s3_load, "s3", mock_s3), \
+             patch.object(_s3_load, "quicksight", mock_qs), \
+             patch.object(_s3_load, "dynamodb", mock_ddb), \
+             patch.object(_s3_load, "CLAWS_LOOKUP_TABLE", "qs-open-data-claws-lookup"), \
+             patch("time.sleep"):
+            result = _s3_load.handler({"source": "Research Data", "format": "csv"}, None)
+
+        assert result["status"] == "loaded"
+        mock_ddb_table.put_item.assert_called_once()
+        call_kwargs = mock_ddb_table.put_item.call_args[1]["Item"]
+        assert call_kwargs["source_id"] == result["claws_source_id"]
+        assert "dataset_id" in call_kwargs
+
+    def test_claws_lookup_write_failure_is_nonfatal(self):
+        mock_s3 = _make_s3_paginator(keys=["datasets/2023.csv"])
+        mock_qs = _mock_qs_s3load()
+        mock_ddb_table = MagicMock()
+        mock_ddb_table.put_item.side_effect = Exception("DDB error")
+        mock_ddb = MagicMock()
+        mock_ddb.Table.return_value = mock_ddb_table
+
+        with patch.object(_s3_load, "_sources", SOURCES), \
+             patch.object(_s3_load, "s3", mock_s3), \
+             patch.object(_s3_load, "quicksight", mock_qs), \
+             patch.object(_s3_load, "dynamodb", mock_ddb), \
+             patch.object(_s3_load, "CLAWS_LOOKUP_TABLE", "qs-open-data-claws-lookup"), \
+             patch("time.sleep"):
+            result = _s3_load.handler({"source": "Research Data", "format": "csv"}, None)
+
+        assert result["status"] == "loaded"
+
+
+# ===========================================================================
+# s3_browse + s3_preview integration tests (OD-14)
+# ===========================================================================
+
+S3_BROWSE_SOURCES = [
+    {"label": "Research Data", "bucket": "uni-research-data",
+     "prefix": "datasets/", "description": "test"},
+]
+CSV_CONTENT = b"id,name,score\n1,Alice,95\n2,Bob,87\n3,Carol,92\n"
+
+
+def _reload_s3_handler(lambda_dir: str, alias: str, substrate_url: str, monkeypatch):
+    monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+    path = os.path.join(REPO_ROOT, "lambdas", lambda_dir, "handler.py")
+    spec = importlib.util.spec_from_file_location(alias, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _seed_s3_bucket(substrate_url: str):
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=substrate_url,
+        region_name="us-east-1",
+        aws_access_key_id="testing",
+        aws_secret_access_key="testing",
+    )
+    s3_client.create_bucket(Bucket="uni-research-data")
+    s3_client.put_object(
+        Bucket="uni-research-data",
+        Key="datasets/2024/enrollment.csv",
+        Body=CSV_CONTENT,
+    )
+    s3_client.put_object(
+        Bucket="uni-research-data",
+        Key="datasets/sample.csv",
+        Body=CSV_CONTENT,
+    )
+    return s3_client
+
+
+@pytest.mark.integration
+class TestS3BrowseIntegration:
+    """s3_browse handler integration tests against Substrate S3."""
+
+    def test_no_args_returns_source_list(self, substrate_url, reset_substrate, monkeypatch):
+        monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
+        h = _reload_s3_handler("s3-browse", "_s3_browse_integ_a", substrate_url, monkeypatch)
+        result = h.handler({}, None)
+        assert result["count"] == 1
+        assert result["sources"][0]["label"] == "Research Data"
+
+    def test_browse_valid_source_returns_keys(self, substrate_url, reset_substrate, monkeypatch):
+        _seed_s3_bucket(substrate_url)
+        monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
+        h = _reload_s3_handler("s3-browse", "_s3_browse_integ_b", substrate_url, monkeypatch)
+        result = h.handler({"source": "Research Data"}, None)
+        assert "error" not in result, f"Unexpected error: {result.get('error')}"
+        assert result["count"] >= 1
+
+    def test_unknown_source_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
+        h = _reload_s3_handler("s3-browse", "_s3_browse_integ_c", substrate_url, monkeypatch)
+        result = h.handler({"source": "Nonexistent Source"}, None)
+        assert "error" in result
+
+
+@pytest.mark.integration
+class TestS3PreviewIntegration:
+    """s3_preview handler integration tests against Substrate S3."""
+
+    def test_csv_preview_returns_schema_and_rows(self, substrate_url, reset_substrate, monkeypatch):
+        _seed_s3_bucket(substrate_url)
+        monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
+        h = _reload_s3_handler("s3-preview", "_s3_preview_integ_a", substrate_url, monkeypatch)
+        result = h.handler({"source": "Research Data", "key": "datasets/sample.csv"}, None)
+        assert result.get("format") == "csv", f"Got: {result}"
+        assert len(result.get("columns", [])) == 3
+        assert len(result.get("sample_rows", [])) >= 1
+
+    def test_missing_key_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        _seed_s3_bucket(substrate_url)
+        monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
+        h = _reload_s3_handler("s3-preview", "_s3_preview_integ_b", substrate_url, monkeypatch)
+        result = h.handler({"source": "Research Data", "key": "datasets/missing.csv"}, None)
+        assert "error" in result
+
+    def test_unknown_source_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
+        h = _reload_s3_handler("s3-preview", "_s3_preview_integ_c", substrate_url, monkeypatch)
+        result = h.handler({"source": "Unknown", "key": "x.csv"}, None)
+        assert "error" in result

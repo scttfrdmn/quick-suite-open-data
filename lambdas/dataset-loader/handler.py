@@ -38,6 +38,7 @@ quicksight = boto3.client(
 TABLE_NAME = os.environ['TABLE_NAME']
 MANIFEST_BUCKET = os.environ['MANIFEST_BUCKET']
 QS_ACCOUNT_ID = os.environ['QUICKSIGHT_ACCOUNT_ID']
+CLAWS_LOOKUP_TABLE = os.environ.get('CLAWS_LOOKUP_TABLE', '')
 
 QS_DIRECT_FORMATS = {'csv', 'tsv', 'parquet', 'json'}
 MAX_MANIFEST_FILES = 200
@@ -246,6 +247,17 @@ def handler(event: dict, context: Any) -> dict:
         except Exception:
             pass
 
+    # Persist claws source_id → dataset_id for downstream compute handoff
+    claws_source_id = f'roda-{slug}'
+    if CLAWS_LOOKUP_TABLE:
+        try:
+            dynamodb.Table(CLAWS_LOOKUP_TABLE).put_item(Item={
+                'source_id': claws_source_id,
+                'dataset_id': ds_id,
+            })
+        except Exception as exc:
+            logger.warning(json.dumps({'claws_lookup_write_failed': str(exc)}))
+
     result = {
         'status': 'loaded',
         'datasetId': ds_id,
@@ -256,7 +268,7 @@ def handler(event: dict, context: Any) -> dict:
         'manifestUri': f's3://{MANIFEST_BUCKET}/{manifest_key}',
         'registryUrl': item.get('registryUrl', ''),
         'quicksightResult': qs_result,
-        'claws_source_id': f'roda-{slug}',
+        'claws_source_id': claws_source_id,
         'suggestions': suggestions,
     }
     if join_manifest_key and join_item:
