@@ -61,10 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared `data_utils` Lambda layer for format detection and schema inference
 - CDK stack with AgentCore Gateway Lambda target wiring and IAM policies scoped to configured sources
 
-[unreleased]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.4.2...HEAD
-[0.4.2]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/scttfrdmn/quick-suite-open-data/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/scttfrdmn/quick-suite-open-data/releases/tag/v0.1.0
+[unreleased]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/scttfrdmn/quick-suite-data/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/scttfrdmn/quick-suite-data/releases/tag/v0.1.0
