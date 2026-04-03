@@ -226,10 +226,12 @@ def derive_slug(name: str, source_key: str) -> str:
     Matches the convention used by the RODA browser.
     """
     # Try to extract from the source key (e.g. roda/ndjson/1000-genomes.ndjson)
+    # Skip generic index/readme filenames — RODA now ships a single index.ndjson
+    # containing all datasets; using the filename as slug would collide all entries.
     basename = source_key.rsplit('/', 1)[-1]
     if basename.endswith('.ndjson') or basename.endswith('.json'):
         slug = basename.rsplit('.', 1)[0]
-        if slug and len(slug) > 2:
+        if slug and len(slug) > 2 and slug.lower() not in ("index", "readme", "catalog"):
             return slug
 
     # Fall back to name-based slug

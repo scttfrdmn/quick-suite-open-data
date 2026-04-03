@@ -264,6 +264,208 @@ class TestQuickSightIntegration:
         assert r2["status"] == "loaded"
         assert r1["datasetId"] != r2["datasetId"]
 
+    # ------------------------------------------------------------------
+    # New integration tests — real DynamoDB + QS via Substrate
+    # ------------------------------------------------------------------
+
+    _INTEG_TABLE = "qs-roda-catalog-integ"
+
+    def _setup(self, substrate_url, monkeypatch, extra_env=None):
+        """
+        Create DDB catalog table + reload handler with Substrate.
+        Returns (handler_module, catalog_table_resource, ddb_client).
+        """
+        import boto3 as _boto3
+
+        ddb_client = _boto3.client(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        ddb_client.create_table(
+            TableName=self._INTEG_TABLE,
+            KeySchema=[{"AttributeName": "slug", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "slug", "AttributeType": "S"},
+                {"AttributeName": "primaryTag", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "by-primary-tag",
+                    "KeySchema": [{"AttributeName": "primaryTag", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb_client.get_waiter("table_exists").wait(TableName=self._INTEG_TABLE)
+
+        ddb_resource = _boto3.resource(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        table = ddb_resource.Table(self._INTEG_TABLE)
+
+        monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+        env = {
+            "TABLE_NAME": self._INTEG_TABLE,
+            "MANIFEST_BUCKET": "qs-manifests-integ",
+            "QUICKSIGHT_ACCOUNT_ID": "123456789012",
+            "QUICKSIGHT_REGION": "us-east-1",
+        }
+        if extra_env:
+            env.update(extra_env)
+        with patch.dict(os.environ, env):
+            h = _load("_dataset_loader_integ2")
+        return h, table, ddb_client
+
+    def test_catalog_item_not_found_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        s3 = _mock_s3_with_files(CSV_FILES)
+        with patch.object(h, "s3", s3):
+            result = h.handler({"slug": "nonexistent-dataset"}, None)
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    def test_no_s3_files_returns_no_matching_files(self, substrate_url, reset_substrate, monkeypatch):
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        table.put_item(Item=CATALOG_ITEM)
+        s3 = _mock_s3_with_files([])
+        with patch.object(h, "s3", s3):
+            result = h.handler({"slug": "noaa-climate", "format": "csv"}, None)
+        assert result.get("status") == "no_matching_files"
+
+    def test_format_auto_detected_from_parquet_extension(
+        self, substrate_url, reset_substrate, monkeypatch
+    ):
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        table.put_item(Item=CATALOG_ITEM)
+        s3 = _mock_s3_with_files(["data/part-0.parquet"])
+        with patch.object(h, "s3", s3):
+            result = h.handler({"slug": "noaa-climate"}, None)
+        assert result.get("format") == "parquet"
+        assert result.get("status") == "loaded"
+
+    def test_sample_only_limits_file_count(self, substrate_url, reset_substrate, monkeypatch):
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        table.put_item(Item=CATALOG_ITEM)
+        s3 = _mock_s3_with_files([f"2020/{i}.csv" for i in range(50)])
+        with patch.object(h, "s3", s3):
+            result = h.handler(
+                {"slug": "noaa-climate", "format": "csv", "sample_only": True}, None
+            )
+        assert result.get("fileCount", 0) <= 10
+
+    def test_suggestions_returned_for_primary_tag(
+        self, substrate_url, reset_substrate, monkeypatch
+    ):
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        table.put_item(Item=dict(CATALOG_ITEM, primaryTag="climate"))
+        for item in SUGG_ITEMS[:3]:
+            table.put_item(Item=dict(item, primaryTag="climate"))
+        s3 = _mock_s3_with_files(CSV_FILES)
+        with patch.object(h, "s3", s3):
+            result = h.handler({"slug": "noaa-climate", "format": "csv"}, None)
+        assert result["status"] == "loaded"
+        sugg = result.get("suggestions", [])
+        assert len(sugg) >= 1
+        assert all("slug" in s and "name" in s for s in sugg)
+
+    def test_suggestions_capped_at_5(self, substrate_url, reset_substrate, monkeypatch):
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        table.put_item(Item=dict(CATALOG_ITEM, primaryTag="climate"))
+        for item in SUGG_ITEMS:  # 6 items → suggestions capped at 5
+            table.put_item(Item=dict(item, primaryTag="climate"))
+        s3 = _mock_s3_with_files(CSV_FILES)
+        with patch.object(h, "s3", s3):
+            result = h.handler({"slug": "noaa-climate", "format": "csv"}, None)
+        assert len(result.get("suggestions", [])) <= 5
+
+    def test_claws_lookup_written_after_load(self, substrate_url, reset_substrate, monkeypatch):
+        import boto3 as _boto3
+
+        _CLAWS_TABLE = "qs-claws-lookup-integ"
+        ddb_claws = _boto3.client(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        ddb_claws.create_table(
+            TableName=_CLAWS_TABLE,
+            KeySchema=[{"AttributeName": "source_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "source_id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb_claws.get_waiter("table_exists").wait(TableName=_CLAWS_TABLE)
+
+        h, table, _ = self._setup(
+            substrate_url, monkeypatch, extra_env={"CLAWS_LOOKUP_TABLE": _CLAWS_TABLE}
+        )
+        table.put_item(Item=CATALOG_ITEM)
+        s3 = _mock_s3_with_files(CSV_FILES)
+        with patch.object(h, "s3", s3):
+            result = h.handler({"slug": "noaa-climate", "format": "csv"}, None)
+
+        assert result["status"] == "loaded"
+        claws_id = result.get("claws_source_id", "")
+        assert claws_id
+        resp = ddb_claws.get_item(
+            TableName=_CLAWS_TABLE,
+            Key={"source_id": {"S": claws_id}},
+        )
+        assert "Item" in resp
+
+    def test_join_happy_path(self, substrate_url, reset_substrate, monkeypatch):
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        table.put_item(Item=CATALOG_ITEM)
+        table.put_item(Item=JOIN_ITEM)
+        s3 = _mock_s3_two_probes(CSV_FILES, ["ocean/2020.csv", "ocean/2021.csv"])
+        with patch.object(h, "s3", s3):
+            result = h.handler(
+                {
+                    "slug": "noaa-climate",
+                    "format": "csv",
+                    "join_slug": "noaa-ocean",
+                    "join_key": "station_id",
+                },
+                None,
+            )
+        assert result["status"] == "loaded"
+        assert result.get("join_applied") is True
+
+    def test_s3_exception_returns_error(
+        self, substrate_url, reset_substrate, monkeypatch, fault_inject
+    ):
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        table.put_item(Item=CATALOG_ITEM)
+        fault_inject("s3", "ListObjectsV2", "InternalError", 500)
+        result = h.handler({"slug": "noaa-climate", "format": "csv"}, None)
+        assert "error" in result
+
+    def test_quicksight_exception_returns_manifest_ready(
+        self, substrate_url, reset_substrate, monkeypatch
+    ):
+        # QuickSight fault injection doesn't work for REST-protocol services in
+        # Substrate (operation name is HTTP method at fault-injection time).
+        # Use MagicMock for QS error injection only; all other AWS calls use Substrate.
+        from unittest.mock import MagicMock
+        h, table, _ = self._setup(substrate_url, monkeypatch)
+        table.put_item(Item=CATALOG_ITEM)
+        s3 = _mock_s3_with_files(CSV_FILES)
+        mock_qs = MagicMock()
+        mock_qs.create_data_source.side_effect = Exception("QuickSight unavailable")
+        with patch.object(h, "s3", s3), patch.object(h, "quicksight", mock_qs):
+            result = h.handler({"slug": "noaa-climate", "format": "csv"}, None)
+        assert result["status"] == "manifest_ready"
+        assert "manifestUri" in result
+
 
 # ---------------------------------------------------------------------------
 # Helpers for join + suggestions tests

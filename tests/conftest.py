@@ -63,6 +63,7 @@ def substrate_url():
         [_SUBSTRATE_BIN, "server"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env={**os.environ, "SUBSTRATE_FAULT_ENABLED": "true"},
     )
     for _ in range(40):
         try:
@@ -89,6 +90,46 @@ def reset_substrate(substrate_url):
     requests.post(f"{substrate_url}/v1/state/reset")
     yield
     requests.post(f"{substrate_url}/v1/state/reset")
+
+
+@pytest.fixture
+def fault_inject(substrate_url):
+    """
+    Fixture for injecting faults via Substrate's /v1/fault/rules API.
+
+    Yields a helper function:
+        inject(service, operation, error_code, http_status=500, probability=1.0)
+
+    Clears all fault rules after the test.
+
+    Example:
+        def test_s3_error(fault_inject):
+            fault_inject("s3", "GetObject", "NoSuchKey", 404)
+            # ... test code that expects the error ...
+    """
+    import requests  # noqa: PLC0415
+
+    def _inject(service, operation, error_code, http_status=500, probability=1.0):
+        resp = requests.post(
+            f"{substrate_url}/v1/fault/rules",
+            json={
+                "enabled": True,
+                "rules": [
+                    {
+                        "service": service,
+                        "operation": operation,
+                        "fault_type": "error",
+                        "error_code": error_code,
+                        "http_status": http_status,
+                        "probability": probability,
+                    }
+                ],
+            },
+        )
+        assert resp.status_code == 200, f"Failed to inject fault: {resp.text}"
+
+    yield _inject
+    requests.delete(f"{substrate_url}/v1/fault/rules")
 
 
 # ---------------------------------------------------------------------------

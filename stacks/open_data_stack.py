@@ -189,6 +189,16 @@ class OpenDataStack(Stack):
             **_s3_kms_kwargs,
         )
 
+        # QuickSight reads manifests from this bucket via the service principal.
+        # Without this, CreateDataSource returns AccessDeniedException.
+        manifest_bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                principals=[iam.ServicePrincipal("quicksight.amazonaws.com")],
+                actions=["s3:GetObject"],
+                resources=[manifest_bucket.arn_for_objects("*")],
+            )
+        )
+
         # -----------------------------------------------------------------
         # Shared Lambda Layer (data_utils.py)
         # -----------------------------------------------------------------
@@ -774,3 +784,9 @@ class OpenDataStack(Stack):
             value=json.dumps(tool_arns),
             description="All tool Lambda ARNs — register each as AgentCore Gateway Lambda target",
         )
+
+        # Internal Lambda ARNs (for E2E testing and operational tooling)
+        CfnOutput(self, "CatalogSyncArn", value=sync_fn.function_arn,
+                  description="catalog-sync internal Lambda ARN")
+        CfnOutput(self, "CatalogQualityCheckArn", value=quality_check_fn.function_arn,
+                  description="catalog-quality-check internal Lambda ARN")

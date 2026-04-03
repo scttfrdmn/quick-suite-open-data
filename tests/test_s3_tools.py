@@ -343,66 +343,65 @@ class TestS3LoadIntegration:
 # s3_load multi-prefix
 # ===========================================================================
 
-def _mock_qs_s3load():
-    """QS mock that completes create_data_source polling on first iteration."""
-    qs = MagicMock()
-    qs.create_data_source.return_value = {
-        "DataSourceId": "test-source",
-        "Arn": "arn:aws:quicksight:us-east-1:123456789012:datasource/test-source",
-    }
-    qs.describe_data_source.return_value = {"DataSource": {"Status": "CREATION_SUCCESSFUL"}}
-    qs.create_data_set.return_value = {}
-    return qs
 
+@pytest.mark.integration
+class TestS3LoadMultiPrefixIntegration:
+    """Tests for the prefixes list parameter — real QuickSight via Substrate."""
 
-class TestS3LoadMultiPrefix:
-    """Tests for the prefixes list parameter added in v0.4.0."""
+    def _reload(self, substrate_url, monkeypatch):
+        monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+        env = {
+            "MANIFEST_BUCKET": "qs-manifests-test",
+            "QUICKSIGHT_ACCOUNT_ID": "123456789012",
+            "QUICKSIGHT_REGION": "us-east-1",
+            "SOURCES_CONFIG": json.dumps(SOURCES),
+        }
+        with patch.dict(os.environ, env):
+            spec = importlib.util.spec_from_file_location(
+                "_s3_load_mp_integ",
+                os.path.join(REPO_ROOT, "lambdas", "s3-load", "handler.py"),
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["_s3_load_mp_integ"] = mod
+            spec.loader.exec_module(mod)
+        return mod
 
-    def test_two_prefixes_combined(self):
+    def test_two_prefixes_combined(self, substrate_url, reset_substrate, monkeypatch):
         # Each prefix probe returns 2 files → 4 total
+        mod = self._reload(substrate_url, monkeypatch)
         mock_s3 = _make_s3_paginator(keys=["f1.csv", "f2.csv"])
-        mock_qs = _mock_qs_s3load()
-        with patch.object(_s3_load, "_sources", SOURCES), \
-             patch.object(_s3_load, "s3", mock_s3), \
-             patch.object(_s3_load, "quicksight", mock_qs), \
-             patch("time.sleep"):
-            result = _s3_load.handler(
+        with patch.object(mod, "s3", mock_s3):
+            result = mod.handler(
                 {"source": "Research Data", "format": "csv", "prefixes": ["2023/", "2024/"]}, None
             )
         assert result["status"] == "loaded"
         assert result["fileCount"] == 4
         assert result["prefixCount"] == 2
 
-    def test_single_prefix_no_prefixes_param(self):
+    def test_single_prefix_no_prefixes_param(self, substrate_url, reset_substrate, monkeypatch):
+        mod = self._reload(substrate_url, monkeypatch)
         mock_s3 = _make_s3_paginator(keys=["datasets/f1.csv", "datasets/f2.csv", "datasets/f3.csv"])
-        mock_qs = _mock_qs_s3load()
-        with patch.object(_s3_load, "_sources", SOURCES), \
-             patch.object(_s3_load, "s3", mock_s3), \
-             patch.object(_s3_load, "quicksight", mock_qs), \
-             patch("time.sleep"):
-            result = _s3_load.handler(
+        with patch.object(mod, "s3", mock_s3):
+            result = mod.handler(
                 {"source": "Research Data", "format": "csv", "prefix": "datasets/"}, None
             )
         assert result["status"] == "loaded"
         assert result["fileCount"] == 3
         assert result["prefixCount"] == 1
 
-    def test_dotdot_in_prefix_returns_error(self):
-        with patch.object(_s3_load, "_sources", SOURCES):
-            result = _s3_load.handler(
-                {"source": "Research Data", "format": "csv", "prefixes": ["../etc/passwd"]}, None
-            )
+    def test_dotdot_in_prefix_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        mod = self._reload(substrate_url, monkeypatch)
+        result = mod.handler(
+            {"source": "Research Data", "format": "csv", "prefixes": ["../etc/passwd"]}, None
+        )
         assert "error" in result
         assert "access denied" in result["error"].lower()
 
-    def test_prefixes_takes_priority_over_prefix(self):
+    def test_prefixes_takes_priority_over_prefix(self, substrate_url, reset_substrate, monkeypatch):
+        mod = self._reload(substrate_url, monkeypatch)
         mock_s3 = _make_s3_paginator(keys=["f1.csv", "f2.csv"])
-        mock_qs = _mock_qs_s3load()
-        with patch.object(_s3_load, "_sources", SOURCES), \
-             patch.object(_s3_load, "s3", mock_s3), \
-             patch.object(_s3_load, "quicksight", mock_qs), \
-             patch("time.sleep"):
-            result = _s3_load.handler(
+        with patch.object(mod, "s3", mock_s3):
+            result = mod.handler(
                 {
                     "source": "Research Data",
                     "format": "csv",
@@ -414,16 +413,13 @@ class TestS3LoadMultiPrefix:
         assert result["status"] == "loaded"
         assert result["prefixCount"] == 2
 
-    def test_sample_only_caps_total_files(self):
+    def test_sample_only_caps_total_files(self, substrate_url, reset_substrate, monkeypatch):
         # 20 files available per prefix; with 3 prefixes and sample_only,
         # max_per_prefix = 10 // 3 = 3 → total ≤ 9
+        mod = self._reload(substrate_url, monkeypatch)
         mock_s3 = _make_s3_paginator(keys=[f"data/f{i}.csv" for i in range(20)])
-        mock_qs = _mock_qs_s3load()
-        with patch.object(_s3_load, "_sources", SOURCES), \
-             patch.object(_s3_load, "s3", mock_s3), \
-             patch.object(_s3_load, "quicksight", mock_qs), \
-             patch("time.sleep"):
-            result = _s3_load.handler(
+        with patch.object(mod, "s3", mock_s3):
+            result = mod.handler(
                 {
                     "source": "Research Data",
                     "format": "csv",
@@ -434,15 +430,13 @@ class TestS3LoadMultiPrefix:
             )
         assert result.get("fileCount", 0) <= 10
 
-    def test_empty_prefixes_list_falls_back_to_no_prefix(self):
-        # Empty list → extra_prefixes = [] → handler uses extra_prefixes = [single_prefix]
+    def test_empty_prefixes_list_falls_back_to_no_prefix(
+        self, substrate_url, reset_substrate, monkeypatch
+    ):
+        mod = self._reload(substrate_url, monkeypatch)
         mock_s3 = _make_s3_paginator(keys=["f1.csv"])
-        mock_qs = _mock_qs_s3load()
-        with patch.object(_s3_load, "_sources", SOURCES), \
-             patch.object(_s3_load, "s3", mock_s3), \
-             patch.object(_s3_load, "quicksight", mock_qs), \
-             patch("time.sleep"):
-            result = _s3_load.handler(
+        with patch.object(mod, "s3", mock_s3):
+            result = mod.handler(
                 {"source": "Research Data", "format": "csv", "prefixes": []}, None
             )
         assert result["status"] == "loaded"
@@ -453,45 +447,77 @@ class TestS3LoadMultiPrefix:
 # s3_load — ClawsLookupTable persistence (OD-17)
 # ===========================================================================
 
-class TestS3LoadClawsLookup:
+_CLAWS_LOOKUP_TABLE = "qs-claws-lookup-test"
+
+
+@pytest.mark.integration
+class TestS3LoadClawsLookupIntegration:
     """After successful QS creation, claws_source_id is written to ClawsLookupTable."""
 
-    def test_claws_lookup_write_called_on_success(self):
-        mock_s3 = _make_s3_paginator(keys=["datasets/2023.csv"])
-        mock_qs = _mock_qs_s3load()
-        mock_ddb_table = MagicMock()
-        mock_ddb = MagicMock()
-        mock_ddb.Table.return_value = mock_ddb_table
+    def _setup_ddb(self, substrate_url):
+        ddb = boto3.client(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        ddb.create_table(
+            TableName=_CLAWS_LOOKUP_TABLE,
+            KeySchema=[{"AttributeName": "source_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "source_id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb.get_waiter("table_exists").wait(TableName=_CLAWS_LOOKUP_TABLE)
+        return ddb
 
-        with patch.object(_s3_load, "_sources", SOURCES), \
-             patch.object(_s3_load, "s3", mock_s3), \
-             patch.object(_s3_load, "quicksight", mock_qs), \
-             patch.object(_s3_load, "dynamodb", mock_ddb), \
-             patch.object(_s3_load, "CLAWS_LOOKUP_TABLE", "qs-open-data-claws-lookup"), \
-             patch("time.sleep"):
-            result = _s3_load.handler({"source": "Research Data", "format": "csv"}, None)
+    def _reload(self, substrate_url, monkeypatch):
+        monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+        env = {
+            "MANIFEST_BUCKET": "qs-manifests-test",
+            "QUICKSIGHT_ACCOUNT_ID": "123456789012",
+            "QUICKSIGHT_REGION": "us-east-1",
+            "SOURCES_CONFIG": json.dumps(SOURCES),
+            "CLAWS_LOOKUP_TABLE": _CLAWS_LOOKUP_TABLE,
+        }
+        with patch.dict(os.environ, env):
+            spec = importlib.util.spec_from_file_location(
+                "_s3_load_claws_integ",
+                os.path.join(REPO_ROOT, "lambdas", "s3-load", "handler.py"),
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["_s3_load_claws_integ"] = mod
+            spec.loader.exec_module(mod)
+        return mod
+
+    def test_claws_lookup_written_on_success(self, substrate_url, reset_substrate, monkeypatch):
+        ddb = self._setup_ddb(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+        mock_s3 = _make_s3_paginator(keys=["datasets/2023.csv"])
+
+        with patch.object(mod, "s3", mock_s3):
+            result = mod.handler({"source": "Research Data", "format": "csv"}, None)
 
         assert result["status"] == "loaded"
-        mock_ddb_table.put_item.assert_called_once()
-        call_kwargs = mock_ddb_table.put_item.call_args[1]["Item"]
-        assert call_kwargs["source_id"] == result["claws_source_id"]
-        assert "dataset_id" in call_kwargs
+        claws_id = result["claws_source_id"]
+        resp = ddb.get_item(
+            TableName=_CLAWS_LOOKUP_TABLE,
+            Key={"source_id": {"S": claws_id}},
+        )
+        assert "Item" in resp
+        assert "dataset_id" in resp["Item"]
 
-    def test_claws_lookup_write_failure_is_nonfatal(self):
+    def test_claws_lookup_write_failure_is_nonfatal(
+        self, substrate_url, reset_substrate, monkeypatch, fault_inject
+    ):
+        """DDB PutItem failure must not fail the load — Substrate fault injection."""
+        self._setup_ddb(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
         mock_s3 = _make_s3_paginator(keys=["datasets/2023.csv"])
-        mock_qs = _mock_qs_s3load()
-        mock_ddb_table = MagicMock()
-        mock_ddb_table.put_item.side_effect = Exception("DDB error")
-        mock_ddb = MagicMock()
-        mock_ddb.Table.return_value = mock_ddb_table
+        fault_inject("dynamodb", "PutItem", "InternalServerError", 500)
 
-        with patch.object(_s3_load, "_sources", SOURCES), \
-             patch.object(_s3_load, "s3", mock_s3), \
-             patch.object(_s3_load, "quicksight", mock_qs), \
-             patch.object(_s3_load, "dynamodb", mock_ddb), \
-             patch.object(_s3_load, "CLAWS_LOOKUP_TABLE", "qs-open-data-claws-lookup"), \
-             patch("time.sleep"):
-            result = _s3_load.handler({"source": "Research Data", "format": "csv"}, None)
+        with patch.object(mod, "s3", mock_s3):
+            result = mod.handler({"source": "Research Data", "format": "csv"}, None)
 
         assert result["status"] == "loaded"
 
@@ -564,6 +590,16 @@ class TestS3BrowseIntegration:
         result = h.handler({"source": "Nonexistent Source"}, None)
         assert "error" in result
 
+    def test_list_s3_error_returns_error(
+        self, substrate_url, reset_substrate, monkeypatch
+    ):
+        # Don't create the bucket — Substrate returns NoSuchBucket naturally,
+        # which s3-browse handler catches and returns as an error dict.
+        monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
+        h = _reload_s3_handler("s3-browse", "_s3_browse_integ_d", substrate_url, monkeypatch)
+        result = h.handler({"source": "Research Data"}, None)
+        assert "error" in result
+
 
 @pytest.mark.integration
 class TestS3PreviewIntegration:
@@ -589,6 +625,20 @@ class TestS3PreviewIntegration:
         monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
         h = _reload_s3_handler("s3-preview", "_s3_preview_integ_c", substrate_url, monkeypatch)
         result = h.handler({"source": "Unknown", "key": "x.csv"}, None)
+        assert "error" in result
+
+    def test_s3_error_on_head_returns_error(
+        self, substrate_url, reset_substrate, monkeypatch
+    ):
+        # Create the bucket but not the file — Substrate returns NoSuchKey naturally,
+        # which s3-preview handler catches and returns as an error dict.
+        boto3.client(
+            "s3", endpoint_url=substrate_url, region_name="us-east-1",
+            aws_access_key_id="test", aws_secret_access_key="test",
+        ).create_bucket(Bucket="uni-research-data")
+        monkeypatch.setenv("SOURCES_CONFIG", json.dumps(S3_BROWSE_SOURCES))
+        h = _reload_s3_handler("s3-preview", "_s3_preview_integ_d", substrate_url, monkeypatch)
+        result = h.handler({"source": "Research Data", "key": "datasets/missing-entirely.csv"}, None)
         assert "error" in result
 
 

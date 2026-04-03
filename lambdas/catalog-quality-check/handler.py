@@ -16,6 +16,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import boto3
 from botocore import UNSIGNED
@@ -59,7 +60,7 @@ def _compute_quality_score(item: dict, now: int) -> dict:
         val = item.get(field)
         if val is not None and val != "" and val != [] and val != {}:
             present += 1
-    schema_completeness = present / len(SCHEMA_COMPLETENESS_FIELDS)
+    schema_completeness = Decimal(str(round(present / len(SCHEMA_COMPLETENESS_FIELDS), 6)))
 
     return {
         "freshness": freshness,

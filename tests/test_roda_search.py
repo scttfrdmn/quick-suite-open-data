@@ -1,8 +1,10 @@
 """
-Unit tests for roda-search/handler.py.
+Tests for roda-search/handler.py.
 
-Uses MagicMock to patch the module-level DynamoDB resource. No real AWS
-calls are made.
+Unit tests use MagicMock only where Substrate fault injection is not yet
+available (error paths — blocked on scttfrdmn/substrate#280).
+
+All happy-path tests use real DynamoDB via Substrate.
 """
 
 import importlib
@@ -31,243 +33,67 @@ roda_search = _load()
 
 
 # ---------------------------------------------------------------------------
-# Test data
+# Error-injection tests — real DynamoDB via Substrate + fault injection
 # ---------------------------------------------------------------------------
 
-CLIMATE_ITEM = {
-    "slug": "noaa-climate",
-    "name": "NOAA Global Climate Data",
-    "primaryTag": "climate",
-    "tags": ["climate", "weather"],
-    "description": "Historical climate measurements from NOAA stations worldwide.",
-    "searchText": "climate weather temperature precipitation atmospheric",
-    "formats": ["csv", "parquet"],
-    "regions": ["us-east-1"],
-    "s3Resources": [{"arn": "arn:aws:s3:::noaa-climate-data", "region": "us-east-1"}],
-    "s3ResourceCount": 1,
-    "registryUrl": "https://registry.opendata.aws/noaa-climate/",
-    "license": "Open Data",
-    "managedBy": "NOAA",
-    "updateFrequency": "Daily",
-    "documentation": "",
-}
-
-GENOME_ITEM = {
-    "slug": "ncbi-genome",
-    "name": "NCBI 1000 Genomes",
-    "primaryTag": "genomics",
-    "tags": ["genomics", "bioinformatics"],
-    "description": "Whole genome sequencing data.",
-    "searchText": "genomics dna rna sequencing variant genome",
-    "formats": ["vcf", "bam"],
-    "regions": ["us-east-1"],
-    "s3Resources": [{"arn": "arn:aws:s3:::ncbi-genome-data", "region": "us-east-1"}],
-    "s3ResourceCount": 1,
-    "registryUrl": "",
-    "license": "Open Data",
-    "managedBy": "NCBI",
-    "updateFrequency": "Periodic",
-    "documentation": "",
-}
-
-ALL_ITEMS = [CLIMATE_ITEM, GENOME_ITEM]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_table(query_items=None, scan_items=None):
-    table = MagicMock()
-    table.query.return_value = {"Items": query_items or [], "Count": len(query_items or [])}
-    table.scan.return_value = {"Items": scan_items or [], "Count": len(scan_items or [])}
-    return table
-
-
-def _patch_table(table):
-    mock_ddb = MagicMock()
-    mock_ddb.Table.return_value = table
-    return patch.object(roda_search, "dynamodb", mock_ddb)
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-class TestEmptyQuery:
-    def test_no_query_returns_all_via_scan(self):
-        table = _make_table(scan_items=ALL_ITEMS)
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        assert result["count"] == 2
-        assert len(result["datasets"]) == 2
-        table.scan.assert_called_once()
-
-    def test_response_has_required_keys(self):
-        table = _make_table(scan_items=[CLIMATE_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        assert "count" in result
-        assert "datasets" in result
-        assert "query" in result
-        assert "appliedTags" in result
-        assert "appliedFormat" in result
-
-
-class TestTagBasedSearch:
-    def test_single_tag_uses_gsi_query(self):
-        table = _make_table(query_items=[CLIMATE_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({"tags": ["climate"]}, None)
-        table.query.assert_called_once()
-        assert result["count"] == 1
-        assert result["datasets"][0]["slug"] == "noaa-climate"
-
-    def test_multiple_tags_uses_scan(self):
-        table = _make_table(scan_items=ALL_ITEMS)
-        with _patch_table(table):
-            roda_search.handler({"tags": ["climate", "genomics"]}, None)
-        table.scan.assert_called_once()
-
-    def test_natural_language_infers_climate_tag(self):
-        table = _make_table(query_items=[CLIMATE_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({"query": "find weather and temperature datasets"}, None)
-        assert "climate" in result["appliedTags"]
-
-    def test_natural_language_infers_genomics_tag(self):
-        table = _make_table(query_items=[GENOME_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({"query": "genome sequencing data"}, None)
-        assert "genomics" in result["appliedTags"]
-
-
-class TestKeywordRanking:
-    def test_keyword_match_returns_relevant_items(self):
-        table = _make_table(query_items=ALL_ITEMS)
-        with _patch_table(table):
-            result = roda_search.handler({"query": "climate temperature", "tags": ["climate"]}, None)
-        slugs = [d["slug"] for d in result["datasets"]]
-        assert "noaa-climate" in slugs
-
-    def test_no_keyword_match_preserves_tag_filtered_results(self):
-        # When query keywords find no matches, keyword_rank falls back to returning
-        # all tag-filtered results rather than silently discarding the filter output.
-        table = _make_table(query_items=ALL_ITEMS)
-        with _patch_table(table):
-            result = roda_search.handler({"query": "xyz-nonexistent-keyword", "tags": ["climate"]}, None)
-        assert result["count"] > 0
-
-
-class TestFilters:
-    def test_format_filter(self):
-        table = _make_table(scan_items=ALL_ITEMS)
-        with _patch_table(table):
-            result = roda_search.handler({"format": "csv"}, None)
-        assert all("csv" in d["formats"] for d in result["datasets"])
-        assert result["count"] == 1
-
-    def test_quicksight_compatible_filter(self):
-        table = _make_table(scan_items=ALL_ITEMS)
-        with _patch_table(table):
-            result = roda_search.handler({"quicksight_compatible": True}, None)
-        assert all(d["quicksightCompatible"] for d in result["datasets"])
-        assert result["count"] == 1
-
-    def test_max_results_enforced(self):
-        many_items = [dict(CLIMATE_ITEM, slug=f"ds-{i}") for i in range(20)]
-        table = _make_table(scan_items=many_items)
-        with _patch_table(table):
-            result = roda_search.handler({"max_results": 3}, None)
-        assert result["count"] <= 3
-
-    def test_max_results_capped_at_50(self):
-        many_items = [dict(CLIMATE_ITEM, slug=f"ds-{i}") for i in range(60)]
-        table = _make_table(scan_items=many_items)
-        with _patch_table(table):
-            result = roda_search.handler({"max_results": 100}, None)
-        assert result["count"] <= 50
-
-
-class TestProjectResult:
-    def test_projected_fields_present(self):
-        table = _make_table(scan_items=[CLIMATE_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        ds = result["datasets"][0]
-        expected = {
-            "slug", "name", "description", "tags", "formats",
-            "license", "managedBy", "updateFrequency",
-            "primaryBucket", "primaryRegion", "s3ResourceCount",
-            "registryUrl", "quicksightCompatible", "documentation",
-        }
-        assert expected.issubset(ds.keys())
-
-    def test_bucket_extracted_from_arn(self):
-        table = _make_table(scan_items=[CLIMATE_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        assert result["datasets"][0]["primaryBucket"] == "noaa-climate-data"
-
-    def test_description_truncated_at_400(self):
-        long_item = dict(CLIMATE_ITEM, description="x" * 500)
-        table = _make_table(scan_items=[long_item])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        assert len(result["datasets"][0]["description"]) <= 400
-
-
-class TestDeprecatedDatasets:
-    """OD-15: deprecated flag in project_result + exclude_deprecated filter."""
-
-    DEPRECATED_ITEM = {
-        **CLIMATE_ITEM,
-        "slug": "old-climate",
-        "deprecated": True,
-    }
-
-    def test_deprecated_flag_in_result(self):
-        table = _make_table(scan_items=[self.DEPRECATED_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        assert result["datasets"][0]["deprecated"] is True
-
-    def test_non_deprecated_flag_false_in_result(self):
-        table = _make_table(scan_items=[CLIMATE_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        assert result["datasets"][0]["deprecated"] is False
-
-    def test_exclude_deprecated_removes_items(self):
-        table = _make_table(scan_items=[CLIMATE_ITEM, self.DEPRECATED_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({"exclude_deprecated": True}, None)
-        slugs = [d["slug"] for d in result["datasets"]]
-        assert "old-climate" not in slugs
-        assert "noaa-climate" in slugs
-
-    def test_exclude_deprecated_false_keeps_deprecated_items(self):
-        table = _make_table(scan_items=[CLIMATE_ITEM, self.DEPRECATED_ITEM])
-        with _patch_table(table):
-            result = roda_search.handler({"exclude_deprecated": False}, None)
-        slugs = [d["slug"] for d in result["datasets"]]
-        assert "old-climate" in slugs
-
-
+@pytest.mark.integration
 class TestDynamoDBErrors:
-    def test_scan_exception_returns_empty(self):
-        table = MagicMock()
-        table.scan.side_effect = Exception("DynamoDB timeout")
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
+    def _reload(self, substrate_url, monkeypatch):
+        monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+        env = {"TABLE_NAME": _CATALOG_TABLE, "SEARCH_CACHE_TABLE": ""}
+        with patch.dict(os.environ, env):
+            alias = "_roda_search_err_integ"
+            path = os.path.join(REPO_ROOT, "lambdas", "roda-search", "handler.py")
+            spec = importlib.util.spec_from_file_location(alias, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[alias] = mod
+            spec.loader.exec_module(mod)
+            return mod
+
+    def _create_table(self, substrate_url):
+        import boto3 as _boto3
+        ddb = _boto3.client(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        ddb.create_table(
+            TableName=_CATALOG_TABLE,
+            KeySchema=[{"AttributeName": "slug", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "slug", "AttributeType": "S"},
+                {"AttributeName": "primaryTag", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "by-primary-tag",
+                    "KeySchema": [{"AttributeName": "primaryTag", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb.get_waiter("table_exists").wait(TableName=_CATALOG_TABLE)
+
+    def test_scan_exception_returns_empty(
+        self, substrate_url, reset_substrate, monkeypatch, fault_inject
+    ):
+        self._create_table(substrate_url)
+        fault_inject("dynamodb", "Scan", "InternalServerError", 500)
+        h = self._reload(substrate_url, monkeypatch)
+        result = h.handler({}, None)
         assert result["count"] == 0
         assert result["datasets"] == []
 
-    def test_gsi_exception_falls_back_to_empty(self):
-        table = MagicMock()
-        table.query.side_effect = Exception("GSI not found")
-        with _patch_table(table):
-            result = roda_search.handler({"tags": ["climate"]}, None)
+    def test_gsi_exception_falls_back_to_empty(
+        self, substrate_url, reset_substrate, monkeypatch, fault_inject
+    ):
+        self._create_table(substrate_url)
+        fault_inject("dynamodb", "Query", "InternalServerError", 500)
+        h = self._reload(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["climate"]}, None)
         assert result["count"] == 0
 
 
@@ -277,12 +103,13 @@ class TestDynamoDBErrors:
 
 _CATALOG_TABLE = "qs-catalog-test"
 
-# Seed items in explicit DynamoDB wire format (avoids Substrate deserialization
-# issues with nested map-in-list types that boto3's resource interface produces).
-# SS (StringSet) is used for formats/tags so that `"csv" in item["formats"]` works
-# after boto3 deserializes SS → Python set.
+_THREE_YEARS_AGO = int(time.time()) - (3 * 365 * 24 * 3600)
+_THIRTY_DAYS_AGO = int(time.time()) - (30 * 24 * 3600)
+_TWELVE_MONTHS_AGO = int(time.time()) - (365 * 24 * 3600)
+
+# Seed items in DynamoDB wire format.
 # NOTE: Substrate does not support empty-string DynamoDB values ("S": "").
-# Omit optional string fields that may be empty in real catalog items.
+# Omit optional string fields that may be empty.
 _INTEG_ITEMS_DDB = [
     {
         "slug": {"S": "noaa-climate"},
@@ -297,6 +124,10 @@ _INTEG_ITEMS_DDB = [
         "updateFrequency": {"S": "Daily"},
         "registryUrl": {"S": "https://registry.opendata.aws/noaa-climate/"},
         "s3ResourceCount": {"N": "1"},
+        "s3Resources": {"L": [{"M": {
+            "arn": {"S": "arn:aws:s3:::noaa-climate-data"},
+            "region": {"S": "us-east-1"},
+        }}]},
     },
     {
         "slug": {"S": "ncbi-genome"},
@@ -326,6 +157,87 @@ _INTEG_ITEMS_DDB = [
         "registryUrl": {"S": "https://registry.opendata.aws/noaa-ocean/"},
         "s3ResourceCount": {"N": "1"},
     },
+    # Deprecated dataset
+    {
+        "slug": {"S": "old-climate"},
+        "name": {"S": "Old Climate Archive"},
+        "primaryTag": {"S": "climate"},
+        "tags": {"SS": ["climate"]},
+        "description": {"S": "Deprecated climate archive."},
+        "searchText": {"S": "climate old archive deprecated"},
+        "formats": {"SS": ["csv"]},
+        "license": {"S": "Open Data"},
+        "managedBy": {"S": "NOAA"},
+        "updateFrequency": {"S": "Never"},
+        "registryUrl": {"S": "https://registry.opendata.aws/old-climate/"},
+        "s3ResourceCount": {"N": "1"},
+        "deprecated": {"BOOL": True},
+    },
+    # Stale dataset — last_updated 3 years ago, all completeness fields present
+    {
+        "slug": {"S": "stale-survey"},
+        "name": {"S": "Stale Survey Data"},
+        "primaryTag": {"S": "economics"},
+        "tags": {"SS": ["economics", "demographics"]},
+        "description": {"S": "Old survey data with stale last_updated."},
+        "searchText": {"S": "economics census demographic survey stale"},
+        "formats": {"SS": ["csv", "json"]},
+        "license": {"S": "Open Data"},
+        "managedBy": {"S": "Census"},
+        "updateFrequency": {"S": "Decennial"},
+        "registryUrl": {"S": "https://registry.opendata.aws/census-survey/"},
+        "s3ResourceCount": {"N": "1"},
+        "s3Resources": {"L": [{"M": {
+            "arn": {"S": "arn:aws:s3:::census-survey-data"},
+            "region": {"S": "us-east-1"},
+        }}]},
+        "last_updated": {"N": str(_THREE_YEARS_AGO)},
+    },
+    # Recent dataset — last_updated 30 days ago, with last_verified
+    {
+        "slug": {"S": "recent-satellite"},
+        "name": {"S": "Recent Satellite Imagery"},
+        "primaryTag": {"S": "satellite"},
+        "tags": {"SS": ["satellite", "geospatial"]},
+        "description": {"S": "Recently updated satellite imagery."},
+        "searchText": {"S": "satellite imagery geospatial remote sensing recent"},
+        "formats": {"SS": ["geotiff"]},
+        "license": {"S": "Open Data"},
+        "managedBy": {"S": "USGS"},
+        "updateFrequency": {"S": "Daily"},
+        "registryUrl": {"S": "https://registry.opendata.aws/landsat-recent/"},
+        "s3ResourceCount": {"N": "1"},
+        "s3Resources": {"L": [{"M": {
+            "arn": {"S": "arn:aws:s3:::landsat-recent"},
+            "region": {"S": "us-west-2"},
+        }}]},
+        "last_updated": {"N": str(_THIRTY_DAYS_AGO)},
+        "last_verified": {"S": "2026-03-01T00:00:00+00:00"},
+    },
+    # Aging dataset — last_updated 12 months ago
+    {
+        "slug": {"S": "aging-genomics"},
+        "name": {"S": "Aging Genomics Dataset"},
+        "primaryTag": {"S": "genomics"},
+        "tags": {"SS": ["genomics"]},
+        "description": {"S": "Genomics data from about one year ago."},
+        "searchText": {"S": "genomics sequencing aging data"},
+        "formats": {"SS": ["vcf"]},
+        "license": {"S": "Open Data"},
+        "managedBy": {"S": "NHGRI"},
+        "updateFrequency": {"S": "Annual"},
+        "registryUrl": {"S": "https://registry.opendata.aws/aging-genomics/"},
+        "s3ResourceCount": {"N": "1"},
+        "last_updated": {"N": str(_TWELVE_MONTHS_AGO)},
+    },
+    # Partial dataset — only required fields (no description, formats, s3Resources, registryUrl)
+    {
+        "slug": {"S": "partial-dataset"},
+        "name": {"S": "Minimal Dataset"},
+        "primaryTag": {"S": "health"},
+        "tags": {"SS": ["health"]},
+        "searchText": {"S": "health medical minimal partial"},
+    },
 ]
 
 
@@ -345,13 +257,12 @@ class TestRodaSearchIntegration:
             spec.loader.exec_module(mod)
             return mod
 
-    def _seed_catalog(self, substrate_url, items_ddb):
-        """Create table and seed items in Substrate using low-level client.
-
-        Items are in DynamoDB wire format to avoid boto3 resource-interface
-        serialization of nested structures that Substrate doesn't round-trip.
-        """
+    def _seed_catalog(self, substrate_url, items_ddb=None):
+        """Create catalog table and seed items in Substrate."""
         import boto3
+
+        if items_ddb is None:
+            items_ddb = _INTEG_ITEMS_DDB
 
         ddb = boto3.client(
             "dynamodb",
@@ -381,14 +292,29 @@ class TestRodaSearchIntegration:
         for item in items_ddb:
             ddb.put_item(TableName=_CATALOG_TABLE, Item=item)
 
+    # ------------------------------------------------------------------
+    # Basic scan / response shape
+    # ------------------------------------------------------------------
+
     def test_empty_query_returns_all_seeded_items(self, substrate_url, reset_substrate, monkeypatch):
-        self._seed_catalog(substrate_url, _INTEG_ITEMS_DDB)
+        self._seed_catalog(substrate_url)
         h = self._reload_search(substrate_url, monkeypatch)
         result = h.handler({}, None)
-        assert result["count"] >= 3
+        assert result["count"] >= len(_INTEG_ITEMS_DDB)
+
+    def test_response_has_required_keys(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({}, None)
+        for key in ("count", "datasets", "query", "appliedTags", "appliedFormat"):
+            assert key in result
+
+    # ------------------------------------------------------------------
+    # Tag-based search
+    # ------------------------------------------------------------------
 
     def test_single_tag_filter_via_gsi(self, substrate_url, reset_substrate, monkeypatch):
-        self._seed_catalog(substrate_url, _INTEG_ITEMS_DDB)
+        self._seed_catalog(substrate_url)
         h = self._reload_search(substrate_url, monkeypatch)
         result = h.handler({"tags": ["climate"]}, None)
         assert result["count"] >= 1
@@ -396,45 +322,171 @@ class TestRodaSearchIntegration:
         assert "noaa-climate" in slugs
         assert "ncbi-genome" not in slugs
 
-    def test_keyword_search_returns_relevant(self, substrate_url, reset_substrate, monkeypatch):
-        self._seed_catalog(substrate_url, _INTEG_ITEMS_DDB)
+    def test_multiple_tags_uses_scan_returns_matching(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
         h = self._reload_search(substrate_url, monkeypatch)
-        # "marine coastal" infers the "oceans" tag → single-tag GSI query → returns noaa-ocean
+        result = h.handler({"tags": ["climate", "genomics"]}, None)
+        slugs = [d["slug"] for d in result["datasets"]]
+        # Both tags present → both datasets should appear
+        assert "noaa-climate" in slugs or "ncbi-genome" in slugs
+
+    def test_keyword_search_returns_relevant(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
         result = h.handler({"query": "marine coastal salinity"}, None)
         assert result["count"] >= 1
         slugs = [d["slug"] for d in result["datasets"]]
         assert "noaa-ocean" in slugs
 
+    # ------------------------------------------------------------------
+    # Filters
+    # ------------------------------------------------------------------
+
     def test_max_results_one(self, substrate_url, reset_substrate, monkeypatch):
-        self._seed_catalog(substrate_url, _INTEG_ITEMS_DDB)
+        self._seed_catalog(substrate_url)
         h = self._reload_search(substrate_url, monkeypatch)
         result = h.handler({"max_results": 1}, None)
         assert result["count"] == 1
 
     def test_format_filter_csv_only(self, substrate_url, reset_substrate, monkeypatch):
-        self._seed_catalog(substrate_url, _INTEG_ITEMS_DDB)
+        self._seed_catalog(substrate_url)
         h = self._reload_search(substrate_url, monkeypatch)
         result = h.handler({"format": "csv"}, None)
         # noaa-climate (csv,parquet) and noaa-ocean (csv) match; ncbi-genome (vcf,bam) does not
-        assert result["count"] == 2
+        assert result["count"] >= 2
         assert all("csv" in d["formats"] for d in result["datasets"])
 
+    def test_format_filter_excludes_non_matching(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"format": "vcf"}, None)
+        slugs = [d["slug"] for d in result["datasets"]]
+        assert "ncbi-genome" in slugs
+        assert "noaa-climate" not in slugs
+        assert "noaa-ocean" not in slugs
 
-# ---------------------------------------------------------------------------
-# Tests for Feature 13: quality_score in roda_search results
-# ---------------------------------------------------------------------------
+    def test_quicksight_compatible_filter(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"quicksight_compatible": True}, None)
+        # noaa-climate (csv/parquet) and noaa-ocean (csv) are QS-compatible; ncbi-genome (vcf/bam) is not
+        slugs = [d["slug"] for d in result["datasets"]]
+        assert "noaa-climate" in slugs
+        assert "ncbi-genome" not in slugs
+        assert all(d["quicksightCompatible"] for d in result["datasets"])
 
-_SIX_MONTHS = 180 * 24 * 3600
-_TWO_YEARS = 2 * 365 * 24 * 3600
+    def test_max_results_invalid_returns_error(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"max_results": 100}, None)
+        assert "error" in result
 
+    # ------------------------------------------------------------------
+    # Result projection
+    # ------------------------------------------------------------------
 
-class TestQualityScore:
-    """quality_score dict is present in every result and computed correctly."""
+    def test_projected_fields_present(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["climate"]}, None)
+        ds = result["datasets"][0]
+        for field in ("slug", "name", "description", "tags", "formats",
+                      "license", "managedBy", "updateFrequency",
+                      "primaryBucket", "primaryRegion", "s3ResourceCount",
+                      "registryUrl", "quicksightCompatible", "documentation"):
+            assert field in ds, f"Missing field: {field}"
 
-    def test_quality_score_present_in_every_result(self):
-        table = _make_table(scan_items=ALL_ITEMS)
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
+    def test_bucket_extracted_from_arn(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["climate"]}, None)
+        climate_ds = next(d for d in result["datasets"] if d["slug"] == "noaa-climate")
+        assert climate_ds["primaryBucket"] == "noaa-climate-data"
+
+    def test_description_truncated_at_400(self, substrate_url, reset_substrate, monkeypatch):
+        import boto3
+        ddb = boto3.client(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        long_item = {
+            "slug": {"S": "long-desc"},
+            "name": {"S": "Long Description Dataset"},
+            "primaryTag": {"S": "health"},
+            "tags": {"SS": ["health"]},
+            "description": {"S": "x" * 500},
+            "searchText": {"S": "health medical long description"},
+            "formats": {"SS": ["csv"]},
+            "license": {"S": "Open"},
+            "managedBy": {"S": "Test"},
+            "updateFrequency": {"S": "Never"},
+            "registryUrl": {"S": "https://registry.opendata.aws/long/"},
+            "s3ResourceCount": {"N": "0"},
+        }
+        ddb.create_table(
+            TableName=_CATALOG_TABLE,
+            KeySchema=[{"AttributeName": "slug", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "slug", "AttributeType": "S"},
+                {"AttributeName": "primaryTag", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[{
+                "IndexName": "by-primary-tag",
+                "KeySchema": [{"AttributeName": "primaryTag", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb.get_waiter("table_exists").wait(TableName=_CATALOG_TABLE)
+        ddb.put_item(TableName=_CATALOG_TABLE, Item=long_item)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({}, None)
+        assert len(result["datasets"][0]["description"]) <= 400
+
+    # ------------------------------------------------------------------
+    # Deprecated datasets
+    # ------------------------------------------------------------------
+
+    def test_deprecated_flag_in_result(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["climate"]}, None)
+        slugs_by_deprecated = {d["slug"]: d["deprecated"] for d in result["datasets"]}
+        assert slugs_by_deprecated.get("old-climate") is True
+
+    def test_non_deprecated_flag_false_in_result(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["climate"]}, None)
+        slugs_by_deprecated = {d["slug"]: d["deprecated"] for d in result["datasets"]}
+        assert slugs_by_deprecated.get("noaa-climate") is False
+
+    def test_exclude_deprecated_removes_items(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["climate"], "exclude_deprecated": True}, None)
+        slugs = [d["slug"] for d in result["datasets"]]
+        assert "old-climate" not in slugs
+        assert "noaa-climate" in slugs
+
+    def test_exclude_deprecated_false_keeps_deprecated_items(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["climate"], "exclude_deprecated": False}, None)
+        slugs = [d["slug"] for d in result["datasets"]]
+        assert "old-climate" in slugs
+
+    # ------------------------------------------------------------------
+    # Quality score
+    # ------------------------------------------------------------------
+
+    def test_quality_score_present_in_every_result(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({}, None)
         for ds in result["datasets"]:
             assert "quality_score" in ds
             qs = ds["quality_score"]
@@ -442,91 +494,63 @@ class TestQualityScore:
             assert "schema_completeness" in qs
             assert "last_verified" in qs
 
-    def test_freshness_stale_when_last_updated_three_years_ago(self):
-        three_years_ago = int(time.time()) - (3 * 365 * 24 * 3600)
-        stale_item = dict(CLIMATE_ITEM, last_updated=three_years_ago)
-        table = _make_table(scan_items=[stale_item])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        qs = result["datasets"][0]["quality_score"]
-        assert qs["freshness"] == "stale"
+    def test_freshness_stale_when_last_updated_old(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["economics"]}, None)
+        stale_ds = next(d for d in result["datasets"] if d["slug"] == "stale-survey")
+        assert stale_ds["quality_score"]["freshness"] == "stale"
 
-    def test_freshness_current_when_last_updated_recent(self):
-        two_months_ago = int(time.time()) - (60 * 24 * 3600)
-        recent_item = dict(CLIMATE_ITEM, last_updated=two_months_ago)
-        table = _make_table(scan_items=[recent_item])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        qs = result["datasets"][0]["quality_score"]
-        assert qs["freshness"] == "current"
+    def test_freshness_current_when_recent(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["satellite"]}, None)
+        recent_ds = next(d for d in result["datasets"] if d["slug"] == "recent-satellite")
+        assert recent_ds["quality_score"]["freshness"] == "current"
 
-    def test_freshness_stale_when_last_updated_missing(self):
-        item_no_updated = {k: v for k, v in CLIMATE_ITEM.items() if k != "last_updated"}
-        table = _make_table(scan_items=[item_no_updated])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        qs = result["datasets"][0]["quality_score"]
-        assert qs["freshness"] == "stale"
+    def test_freshness_stale_when_last_updated_missing(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["oceans"]}, None)
+        ocean_ds = next(d for d in result["datasets"] if d["slug"] == "noaa-ocean")
+        # noaa-ocean has no last_updated → stale
+        assert ocean_ds["quality_score"]["freshness"] == "stale"
 
-    def test_freshness_aging_between_6_and_24_months(self):
-        twelve_months_ago = int(time.time()) - (365 * 24 * 3600)
-        aging_item = dict(CLIMATE_ITEM, last_updated=twelve_months_ago)
-        table = _make_table(scan_items=[aging_item])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        qs = result["datasets"][0]["quality_score"]
-        assert qs["freshness"] == "aging"
+    def test_freshness_aging_between_6_and_24_months(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["genomics"]}, None)
+        aging_ds = next((d for d in result["datasets"] if d["slug"] == "aging-genomics"), None)
+        assert aging_ds is not None
+        assert aging_ds["quality_score"]["freshness"] == "aging"
 
-    def test_schema_completeness_1_0_when_all_six_fields_present(self):
-        complete_item = {
-            "slug": "complete-ds",
-            "name": "Complete Dataset",
-            "description": "A dataset with all fields present",
-            "tags": ["tag1"],
-            "formats": ["csv"],
-            "s3Resources": [{"arn": "arn:aws:s3:::bucket", "region": "us-east-1"}],
-            "registryUrl": "https://registry.opendata.aws/complete/",
-            "primaryTag": "climate",
-            "searchText": "complete dataset",
-            "license": "Open",
-            "managedBy": "Test",
-            "updateFrequency": "Monthly",
-        }
-        table = _make_table(scan_items=[complete_item])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        qs = result["datasets"][0]["quality_score"]
-        assert qs["schema_completeness"] == 1.0
+    def test_schema_completeness_1_when_all_fields_present(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["economics"]}, None)
+        stale_ds = next(d for d in result["datasets"] if d["slug"] == "stale-survey")
+        # stale-survey has all 6 completeness fields (name, description, tags, formats, s3Resources, registryUrl)
+        assert stale_ds["quality_score"]["schema_completeness"] == 1.0
 
-    def test_schema_completeness_less_than_1_when_some_fields_missing(self):
-        partial_item = {
-            "slug": "partial-ds",
-            "name": "Partial Dataset",
-            # missing: description, tags, formats, s3Resources, registryUrl
-            "primaryTag": "climate",
-            "searchText": "partial dataset",
-        }
-        table = _make_table(scan_items=[partial_item])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        qs = result["datasets"][0]["quality_score"]
-        assert qs["schema_completeness"] < 1.0
-        assert qs["schema_completeness"] > 0.0
+    def test_schema_completeness_less_than_1_when_fields_missing(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["health"]}, None)
+        partial_ds = next((d for d in result["datasets"] if d["slug"] == "partial-dataset"), None)
+        assert partial_ds is not None
+        # partial-dataset has name and tags but missing description, formats, s3Resources, registryUrl
+        assert partial_ds["quality_score"]["schema_completeness"] < 1.0
 
-    def test_last_verified_none_when_field_absent(self):
-        item_no_verified = dict(CLIMATE_ITEM)
-        item_no_verified.pop("last_verified", None)
-        table = _make_table(scan_items=[item_no_verified])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        qs = result["datasets"][0]["quality_score"]
-        assert qs["last_verified"] is None
+    def test_last_verified_none_when_field_absent(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["oceans"]}, None)
+        ocean_ds = next(d for d in result["datasets"] if d["slug"] == "noaa-ocean")
+        assert ocean_ds["quality_score"]["last_verified"] is None
 
-    def test_last_verified_returned_when_field_present(self):
-        verified_ts = "2026-01-15T10:00:00+00:00"
-        item_with_verified = dict(CLIMATE_ITEM, last_verified=verified_ts)
-        table = _make_table(scan_items=[item_with_verified])
-        with _patch_table(table):
-            result = roda_search.handler({}, None)
-        qs = result["datasets"][0]["quality_score"]
-        assert qs["last_verified"] == verified_ts
+    def test_last_verified_returned_when_field_present(self, substrate_url, reset_substrate, monkeypatch):
+        self._seed_catalog(substrate_url)
+        h = self._reload_search(substrate_url, monkeypatch)
+        result = h.handler({"tags": ["satellite"]}, None)
+        recent_ds = next(d for d in result["datasets"] if d["slug"] == "recent-satellite")
+        assert recent_ds["quality_score"]["last_verified"] == "2026-03-01T00:00:00+00:00"

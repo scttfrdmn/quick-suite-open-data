@@ -1,15 +1,20 @@
 """
-Unit tests for catalog-sync/handler.py.
+Tests for catalog-sync/handler.py.
 
-Tests transform_dataset(), derive_slug(), detect_formats(), handle_full_sync(),
-and handle_sns_update() using MagicMock — no real AWS calls.
+Pure-logic tests (transform_dataset, derive_slug, detect_formats, handler routing)
+use no AWS calls.  Error-injection and happy-path tests use real S3 + DynamoDB via
+Substrate (fault injection via /v1/fault/rules for error paths).
 """
 
+import importlib
 import importlib.util
 import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
+
+import boto3
+import pytest
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 
@@ -229,188 +234,138 @@ class TestDetectFormats:
 
 
 # ---------------------------------------------------------------------------
-# handle_full_sync() tests
+# handle_full_sync() / handle_sns_update() error-injection tests
+# (kept as MagicMock — blocked on scttfrdmn/substrate#280)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.integration
 class TestHandleFullSync:
-    def _make_ndjson(self, datasets):
-        return "\n".join(json.dumps(ds) for ds in datasets).encode("utf-8")
+    """S3 error during full sync — Substrate fault injection."""
 
-    def test_full_sync_returns_counts(self):
-        mock_table = MagicMock()
-        ndjson = self._make_ndjson([SAMPLE_DATASET])
+    def test_full_sync_handles_s3_error_gracefully(
+        self, substrate_url, reset_substrate, monkeypatch, fault_inject
+    ):
+        # Create DDB table and S3 bucket; put a valid ndjson key so the
+        # paginator returns one entry, then inject GetObject failure.
+        import boto3 as _boto3
 
-        with patch.object(handler_mod, "s3") as mock_s3:
-            paginator = MagicMock()
-            mock_s3.get_paginator.return_value = paginator
-            paginator.paginate.return_value = [
-                {
-                    "Contents": [
-                        {"Key": "roda/ndjson/noaa-climate.ndjson"}
-                    ]
-                }
-            ]
-            mock_s3.get_object.return_value = {
-                "Body": MagicMock(read=lambda: ndjson)
-            }
+        ddb = _boto3.client(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        ddb.create_table(
+            TableName=_SYNC_TABLE,
+            KeySchema=[{"AttributeName": "slug", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "slug", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb.get_waiter("table_exists").wait(TableName=_SYNC_TABLE)
 
-            result = handler_mod.handle_full_sync(mock_table)
+        s3 = _boto3.client(
+            "s3",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        s3.create_bucket(Bucket=_SYNC_BUCKET)
+        s3.put_object(
+            Bucket=_SYNC_BUCKET,
+            Key=f"{_SYNC_PREFIX}broken.ndjson",
+            Body=b"placeholder",
+        )
 
-        assert result["statusCode"] == 200
-        body = json.loads(result["body"])
-        assert body["synced"] == 1
-        assert body["errors"] == 0
+        fault_inject("s3", "GetObject", "InternalError", 500)
 
-    def test_full_sync_calls_put_item(self):
-        mock_table = MagicMock()
-        ndjson = self._make_ndjson([SAMPLE_DATASET])
+        monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+        env = {
+            "TABLE_NAME": _SYNC_TABLE,
+            "RODA_BUCKET": _SYNC_BUCKET,
+            "RODA_PREFIX": _SYNC_PREFIX,
+        }
+        with patch.dict(os.environ, env):
+            alias = "_catalog_sync_err_integ"
+            path = os.path.join(REPO_ROOT, "lambdas", "catalog-sync", "handler.py")
+            spec = importlib.util.spec_from_file_location(alias, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[alias] = mod
+            spec.loader.exec_module(mod)
 
-        with patch.object(handler_mod, "s3") as mock_s3:
-            paginator = MagicMock()
-            mock_s3.get_paginator.return_value = paginator
-            paginator.paginate.return_value = [
-                {"Contents": [{"Key": "roda/ndjson/noaa-climate.ndjson"}]}
-            ]
-            mock_s3.get_object.return_value = {
-                "Body": MagicMock(read=lambda: ndjson)
-            }
-            handler_mod.handle_full_sync(mock_table)
-
-        mock_table.put_item.assert_called_once()
-        call_kwargs = mock_table.put_item.call_args[1]
-        assert call_kwargs["Item"]["slug"] == "noaa-climate"
-
-    def test_full_sync_skips_non_ndjson(self):
-        mock_table = MagicMock()
-
-        with patch.object(handler_mod, "s3") as mock_s3:
-            paginator = MagicMock()
-            mock_s3.get_paginator.return_value = paginator
-            paginator.paginate.return_value = [
-                {"Contents": [{"Key": "roda/ndjson/README.md"}]}
-            ]
-            result = handler_mod.handle_full_sync(mock_table)
-
-        mock_table.put_item.assert_not_called()
-        assert json.loads(result["body"])["synced"] == 0
-
-    def test_full_sync_handles_s3_error_gracefully(self):
-        mock_table = MagicMock()
-
-        with patch.object(handler_mod, "s3") as mock_s3:
-            paginator = MagicMock()
-            mock_s3.get_paginator.return_value = paginator
-            paginator.paginate.return_value = [
-                {"Contents": [{"Key": "roda/ndjson/broken.ndjson"}]}
-            ]
-            mock_s3.get_object.side_effect = Exception("S3 unavailable")
-
-            result = handler_mod.handle_full_sync(mock_table)
-
+        result = mod.handle_full_sync(mod.dynamodb.Table(_SYNC_TABLE))
         body = json.loads(result["body"])
         assert body["errors"] == 1
         assert body["synced"] == 0
 
-    def test_full_sync_multiple_datasets_in_one_file(self):
-        mock_table = MagicMock()
-        ndjson = self._make_ndjson([SAMPLE_DATASET, {**SAMPLE_DATASET, "Name": "Second Dataset"}])
 
-        with patch.object(handler_mod, "s3") as mock_s3:
-            paginator = MagicMock()
-            mock_s3.get_paginator.return_value = paginator
-            paginator.paginate.return_value = [
-                {"Contents": [{"Key": "roda/ndjson/multi.ndjson"}]}
-            ]
-            mock_s3.get_object.return_value = {
-                "Body": MagicMock(read=lambda: ndjson)
-            }
-            result = handler_mod.handle_full_sync(mock_table)
-
-        assert json.loads(result["body"])["synced"] == 2
-        assert mock_table.put_item.call_count == 2
-
-    def test_full_sync_skips_empty_lines(self):
-        mock_table = MagicMock()
-        # NDJSON with blank lines interspersed
-        raw = "\n" + json.dumps(SAMPLE_DATASET) + "\n\n"
-
-        with patch.object(handler_mod, "s3") as mock_s3:
-            paginator = MagicMock()
-            mock_s3.get_paginator.return_value = paginator
-            paginator.paginate.return_value = [
-                {"Contents": [{"Key": "roda/ndjson/x.ndjson"}]}
-            ]
-            mock_s3.get_object.return_value = {
-                "Body": MagicMock(read=lambda: raw.encode("utf-8"))
-            }
-            result = handler_mod.handle_full_sync(mock_table)
-
-        assert json.loads(result["body"])["synced"] == 1
-
-
-# ---------------------------------------------------------------------------
-# handle_sns_update() tests
-# ---------------------------------------------------------------------------
-
+@pytest.mark.integration
 class TestHandleSnsUpdate:
+    """S3 error during SNS update — Substrate fault injection."""
+
     def _sns_event(self, s3_key):
         s3_notification = json.dumps({
-            "Records": [
-                {"s3": {"object": {"key": s3_key}}}
-            ]
+            "Records": [{"s3": {"object": {"key": s3_key}}}]
         })
         return {
-            "Records": [
-                {
-                    "EventSource": "aws:sns",
-                    "Sns": {"Message": s3_notification},
-                }
-            ]
+            "Records": [{
+                "EventSource": "aws:sns",
+                "Sns": {"Message": s3_notification},
+            }]
         }
 
-    def test_sns_update_returns_200(self):
-        mock_table = MagicMock()
-        ndjson = json.dumps(SAMPLE_DATASET).encode("utf-8")
+    def test_sns_update_handles_s3_error_gracefully(
+        self, substrate_url, reset_substrate, monkeypatch, fault_inject
+    ):
+        import boto3 as _boto3
 
-        with patch.object(handler_mod, "s3") as mock_s3:
-            mock_s3.get_object.return_value = {
-                "Body": MagicMock(read=lambda: ndjson)
-            }
-            result = handler_mod.handle_sns_update(
-                self._sns_event("roda/ndjson/noaa-climate.ndjson"),
-                mock_table
-            )
+        ddb = _boto3.client(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        ddb.create_table(
+            TableName=_SYNC_TABLE,
+            KeySchema=[{"AttributeName": "slug", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "slug", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb.get_waiter("table_exists").wait(TableName=_SYNC_TABLE)
 
+        s3 = _boto3.client(
+            "s3",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        s3.create_bucket(Bucket=_SYNC_BUCKET)
+
+        fault_inject("s3", "GetObject", "InternalError", 500)
+
+        monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+        env = {
+            "TABLE_NAME": _SYNC_TABLE,
+            "RODA_BUCKET": _SYNC_BUCKET,
+            "RODA_PREFIX": _SYNC_PREFIX,
+        }
+        with patch.dict(os.environ, env):
+            alias = "_catalog_sync_sns_err_integ"
+            path = os.path.join(REPO_ROOT, "lambdas", "catalog-sync", "handler.py")
+            spec = importlib.util.spec_from_file_location(alias, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[alias] = mod
+            spec.loader.exec_module(mod)
+
+        key = f"{_SYNC_PREFIX}noaa-climate.ndjson"
+        result = mod.handle_sns_update(self._sns_event(key), mod.dynamodb.Table(_SYNC_TABLE))
         assert result["statusCode"] == 200
-
-    def test_sns_update_calls_put_item(self):
-        mock_table = MagicMock()
-        ndjson = json.dumps(SAMPLE_DATASET).encode("utf-8")
-
-        with patch.object(handler_mod, "s3") as mock_s3:
-            mock_s3.get_object.return_value = {
-                "Body": MagicMock(read=lambda: ndjson)
-            }
-            handler_mod.handle_sns_update(
-                self._sns_event("roda/ndjson/noaa-climate.ndjson"),
-                mock_table
-            )
-
-        mock_table.put_item.assert_called_once()
-
-    def test_sns_update_handles_s3_error_gracefully(self):
-        mock_table = MagicMock()
-
-        with patch.object(handler_mod, "s3") as mock_s3:
-            mock_s3.get_object.side_effect = Exception("S3 error")
-            # Should not raise
-            result = handler_mod.handle_sns_update(
-                self._sns_event("roda/ndjson/noaa-climate.ndjson"),
-                mock_table
-            )
-
-        assert result["statusCode"] == 200
-        mock_table.put_item.assert_not_called()
+        # No items should have been written (GetObject failed)
+        resp = ddb.scan(TableName=_SYNC_TABLE)
+        assert len(resp.get("Items", [])) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -449,3 +404,173 @@ class TestHandlerRouting:
 
         mock_sns.assert_called_once()
         mock_full_sync.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Integration tests — real S3 + DynamoDB via Substrate
+# ---------------------------------------------------------------------------
+
+_SYNC_TABLE = "qs-catalog-sync-test"
+_SYNC_BUCKET = "roda-catalog-test"
+_SYNC_PREFIX = "ndjson/"
+
+_SYNC_SAMPLE_DATASET = {
+    "Name": "NOAA Global Climate Data",
+    "Description": "Historical temperature and precipitation records in CSV and Parquet format.",
+    "Tags": ["climate", "weather", "noaa"],
+    "License": "Open Data",
+    "ManagedBy": "NOAA",
+    "UpdateFrequency": "Daily",
+    "Resources": [
+        {
+            "Type": "S3 Bucket",
+            "ARN": "arn:aws:s3:::noaa-climate-bucket",
+            "Region": "us-east-1",
+            "Description": "CSV and Parquet files",
+            "RequesterPays": False,
+            "AccountRequired": False,
+        }
+    ],
+}
+
+_SYNC_SECOND_DATASET = {
+    "Name": "Landsat 8 Imagery",
+    "Description": "GeoTIFF satellite imagery from Landsat 8.",
+    "Tags": ["satellite", "geospatial"],
+    "License": "Open Data",
+    "ManagedBy": "USGS",
+    "UpdateFrequency": "Daily",
+    "Resources": [],
+}
+
+
+@pytest.mark.integration
+class TestCatalogSyncIntegration:
+
+    def _setup(self, substrate_url):
+        import boto3 as _boto3
+
+        ddb = _boto3.client(
+            "dynamodb",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        ddb.create_table(
+            TableName=_SYNC_TABLE,
+            KeySchema=[{"AttributeName": "slug", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "slug", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        ddb.get_waiter("table_exists").wait(TableName=_SYNC_TABLE)
+
+        s3 = _boto3.client(
+            "s3",
+            endpoint_url=substrate_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+        s3.create_bucket(Bucket=_SYNC_BUCKET)
+        return ddb, s3
+
+    def _reload(self, substrate_url, monkeypatch):
+        import importlib.util as _ilu
+
+        monkeypatch.setenv("AWS_ENDPOINT_URL", substrate_url)
+        env = {
+            "TABLE_NAME": _SYNC_TABLE,
+            "RODA_BUCKET": _SYNC_BUCKET,
+            "RODA_PREFIX": _SYNC_PREFIX,
+        }
+        with patch.dict(os.environ, env):
+            alias = "_catalog_sync_integ"
+            path = os.path.join(REPO_ROOT, "lambdas", "catalog-sync", "handler.py")
+            spec = _ilu.spec_from_file_location(alias, path)
+            mod = _ilu.module_from_spec(spec)
+            sys.modules[alias] = mod
+            spec.loader.exec_module(mod)
+        return mod
+
+    def _put_ndjson(self, s3_client, key, datasets):
+        ndjson = "\n".join(json.dumps(d) for d in datasets).encode()
+        s3_client.put_object(Bucket=_SYNC_BUCKET, Key=key, Body=ndjson)
+
+    def test_full_sync_writes_item_to_dynamodb(self, substrate_url, reset_substrate, monkeypatch):
+        ddb, s3 = self._setup(substrate_url)
+        self._put_ndjson(s3, f"{_SYNC_PREFIX}noaa-climate.ndjson", [_SYNC_SAMPLE_DATASET])
+        mod = self._reload(substrate_url, monkeypatch)
+        mod.handle_full_sync(mod.dynamodb.Table(_SYNC_TABLE))
+        resp = ddb.get_item(
+            TableName=_SYNC_TABLE,
+            Key={"slug": {"S": "noaa-climate"}},
+        )
+        assert "Item" in resp
+        assert resp["Item"]["name"]["S"] == "NOAA Global Climate Data"
+
+    def test_full_sync_returns_synced_count(self, substrate_url, reset_substrate, monkeypatch):
+        ddb, s3 = self._setup(substrate_url)
+        self._put_ndjson(s3, f"{_SYNC_PREFIX}noaa-climate.ndjson", [_SYNC_SAMPLE_DATASET])
+        mod = self._reload(substrate_url, monkeypatch)
+        result = mod.handle_full_sync(mod.dynamodb.Table(_SYNC_TABLE))
+        body = json.loads(result["body"])
+        assert body["synced"] == 1
+        assert body["errors"] == 0
+
+    def test_full_sync_skips_non_ndjson_keys(self, substrate_url, reset_substrate, monkeypatch):
+        ddb, s3 = self._setup(substrate_url)
+        s3.put_object(Bucket=_SYNC_BUCKET, Key=f"{_SYNC_PREFIX}readme.txt", Body=b"not a dataset")
+        self._put_ndjson(s3, f"{_SYNC_PREFIX}noaa-climate.ndjson", [_SYNC_SAMPLE_DATASET])
+        mod = self._reload(substrate_url, monkeypatch)
+        result = mod.handle_full_sync(mod.dynamodb.Table(_SYNC_TABLE))
+        body = json.loads(result["body"])
+        assert body["synced"] == 1
+
+    def test_full_sync_multiple_datasets_in_one_file(self, substrate_url, reset_substrate, monkeypatch):
+        ddb, s3 = self._setup(substrate_url)
+        self._put_ndjson(s3, f"{_SYNC_PREFIX}multi.ndjson", [_SYNC_SAMPLE_DATASET, _SYNC_SECOND_DATASET])
+        mod = self._reload(substrate_url, monkeypatch)
+        result = mod.handle_full_sync(mod.dynamodb.Table(_SYNC_TABLE))
+        body = json.loads(result["body"])
+        assert body["synced"] == 2
+        assert body["errors"] == 0
+
+    def test_full_sync_skips_empty_lines(self, substrate_url, reset_substrate, monkeypatch):
+        ddb, s3 = self._setup(substrate_url)
+        content = (
+            json.dumps(_SYNC_SAMPLE_DATASET) + "\n\n" + json.dumps(_SYNC_SECOND_DATASET) + "\n"
+        ).encode()
+        s3.put_object(Bucket=_SYNC_BUCKET, Key=f"{_SYNC_PREFIX}spaced.ndjson", Body=content)
+        mod = self._reload(substrate_url, monkeypatch)
+        result = mod.handle_full_sync(mod.dynamodb.Table(_SYNC_TABLE))
+        body = json.loads(result["body"])
+        assert body["synced"] == 2
+
+    def test_sns_update_writes_item(self, substrate_url, reset_substrate, monkeypatch):
+        ddb, s3 = self._setup(substrate_url)
+        key = f"{_SYNC_PREFIX}noaa-climate.ndjson"
+        self._put_ndjson(s3, key, [_SYNC_SAMPLE_DATASET])
+        mod = self._reload(substrate_url, monkeypatch)
+        s3_notification = json.dumps({"Records": [{"s3": {"object": {"key": key}}}]})
+        event = {
+            "Records": [{"EventSource": "aws:sns", "Sns": {"Message": s3_notification}}]
+        }
+        mod.handle_sns_update(event, mod.dynamodb.Table(_SYNC_TABLE))
+        resp = ddb.get_item(
+            TableName=_SYNC_TABLE,
+            Key={"slug": {"S": "noaa-climate"}},
+        )
+        assert "Item" in resp
+
+    def test_sns_update_returns_200(self, substrate_url, reset_substrate, monkeypatch):
+        ddb, s3 = self._setup(substrate_url)
+        key = f"{_SYNC_PREFIX}noaa-climate.ndjson"
+        self._put_ndjson(s3, key, [_SYNC_SAMPLE_DATASET])
+        mod = self._reload(substrate_url, monkeypatch)
+        s3_notification = json.dumps({"Records": [{"s3": {"object": {"key": key}}}]})
+        event = {
+            "Records": [{"EventSource": "aws:sns", "Sns": {"Message": s3_notification}}]
+        }
+        result = mod.handle_sns_update(event, mod.dynamodb.Table(_SYNC_TABLE))
+        assert result["statusCode"] == 200

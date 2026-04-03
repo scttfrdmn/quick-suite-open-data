@@ -13,7 +13,6 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "moto[dynamodb,s3]>=5.0",
     "requests>=2.31",
     "ruff>=0.4",
 ]
@@ -30,4 +29,6 @@ ignore = ["E501"]
 testpaths = ["tests"]
 markers = [
     "integration: requires Substrate running (auto-started from ~/src/substrate)",
+    "e2e: end-to-end tests against a deployed QuickSuiteOpenData stack (real AWS; set AWS_PROFILE=aws)",
+    "qs_write: QuickSight write test within E2E suite — requires QS_E2E_ALLOW_WRITES=true",
 ]
