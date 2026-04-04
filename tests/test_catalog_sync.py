@@ -13,7 +13,6 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
-import boto3
 import pytest
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")

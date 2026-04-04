@@ -8,8 +8,6 @@ run against the state written by that single invocation.
 
 import pytest
 
-from tests.e2e.conftest import E2E_SLUG_PREFIX
-
 pytestmark = pytest.mark.e2e
 
 
