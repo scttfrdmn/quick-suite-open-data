@@ -31,8 +31,9 @@ steps:
     tool: roda_load
     stack: data
     description: "Load the first result into Quick Sight"
+    # soft skip: if search returned count=0, roda_load will return {"error": "..."} — assert only exists
     input:
-      dataset_slug: "{search.datasets.0.slug}"
+      slug: "{search.datasets.0.slug}"
     assert:
       - path: "dataset_id"
         op: exists
@@ -44,7 +45,7 @@ steps:
     stack: data
     description: "Browse the source S3 bucket to confirm data is accessible"
     input:
-      source_id: "noaa-ghcn-pds"
+      source: "NOAA GHCN Daily"
       prefix: ""
       max_keys: 10
     assert:

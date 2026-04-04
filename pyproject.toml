@@ -15,6 +15,7 @@ dev = [
     "pytest-cov>=4.0",
     "requests>=2.31",
     "ruff>=0.4",
+    "boto3>=1.26",
 ]
 
 [tool.ruff]
