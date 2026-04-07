@@ -1,10 +1,16 @@
 """
-redshift_preview: Sample rows from a Redshift Serverless table.
+redshift_query: Execute a parameterized read-only SQL query against Redshift Serverless.
 
 AgentCore Lambda target — invoked directly by the Gateway.
 Event dict contains tool arguments. Returns a plain dict.
 
-Uses boto3 redshift-data client.
+Uses boto3 redshift-data client (Redshift Data API async pattern).
+
+Tool arguments:
+  connection_id: str (required) — source ID from qs-data-source-registry
+  query:         str (required) — parameterized SQL with ? placeholders (Redshift uses $1, $2 internally but we substitute ? for consistency)
+  params:        list (optional) — bind parameter values (strings/numbers)
+  max_rows:      int (optional, default 100, max 1000)
 """
 
 import json
@@ -28,11 +34,17 @@ CALLER_SECRETS_ALLOWED_ARNS: list[str] = [
     for p in os.environ.get("CALLER_SECRETS_ALLOWED_ARNS", "").split(",")
     if p.strip()
 ]
-_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_]+$")
 _SECRET_ARN_RE = re.compile(r"^arn:aws:secretsmanager:[a-z0-9\-]+:\d{12}:secret:.+$")
+_MAX_ROWS = 1000
 
-_POLL_MAX = 30
+_POLL_MAX = 60
 _POLL_INTERVAL = 1
+
+# Mutation detection
+_MUTATION_PATTERN = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|TRUNCATE|ALTER|MERGE|REPLACE|UPSERT)\b",
+    re.IGNORECASE,
+)
 
 
 def _resolve_caller_secret_arn(caller_arn: str) -> str | None:
@@ -47,7 +59,7 @@ def _resolve_caller_secret_arn(caller_arn: str) -> str | None:
 
 
 def _get_redshift_config(secret_arn: str | None = None) -> dict | None:
-    """Fetch Redshift connection config from Secrets Manager. Returns None if not configured."""
+    """Fetch Redshift connection config from Secrets Manager."""
     arn = secret_arn or REDSHIFT_SECRET_ARN
     if not arn:
         return None
@@ -60,11 +72,7 @@ def _get_redshift_config(secret_arn: str | None = None) -> dict | None:
 
 
 def _poll_statement(statement_id: str) -> dict:
-    """
-    Poll describe_statement until terminal status or timeout.
-
-    Returns the final describe_statement response or raises on timeout.
-    """
+    """Poll DescribeStatement until terminal status or timeout."""
     for _ in range(_POLL_MAX):
         resp = redshift_data.describe_statement(Id=statement_id)
         status = resp.get("Status", "")
@@ -74,47 +82,52 @@ def _poll_statement(statement_id: str) -> dict:
     raise TimeoutError(f"Redshift statement {statement_id} did not complete in {_POLL_MAX}s")
 
 
-def handler(event: dict, context: Any) -> dict:
+def _replace_placeholders(query: str, params: list) -> tuple[str, list]:
     """
-    Sample rows from a Redshift Serverless table.
+    Replace ? placeholders with $1, $2, ... for Redshift Data API.
 
-    Tool arguments:
-    - source_id: str (required) — identifier for the Redshift source
-    - schema: str (required) — table schema
-    - table: str (required) — table name
-    - max_rows: int (optional, default 5, max 25)
+    Returns (rewritten_query, params_for_api).
+    The Redshift Data API uses positional parameters as SQL_PARAMETERS list.
     """
+    idx = 0
+    result = []
+    for ch in query:
+        if ch == "?":
+            idx += 1
+            result.append(f"${idx}")
+        else:
+            result.append(ch)
+    return "".join(result), params
+
+
+def handler(event: dict, context: Any) -> dict:
     _tool_name = "unknown"
     try:
         raw = context.client_context.custom["bedrockAgentCoreToolName"]
         _tool_name = raw.split("___")[-1]
     except Exception:
         pass
-    logger.info(json.dumps({"tool": _tool_name, "event": event}))
+    logger.info(json.dumps({"tool": _tool_name, "connection_id": event.get("connection_id")}))
 
-    source_id = (event.get("source_id") or "").strip()
-    if not source_id:
-        return {"error": "source_id is required"}
+    connection_id = (event.get("connection_id") or "").strip()
+    if not connection_id:
+        return {"error": "connection_id is required"}
 
-    schema = (event.get("schema") or "").strip()
-    if not schema:
-        return {"error": "schema is required"}
+    query = (event.get("query") or "").strip()
+    if not query:
+        return {"error": "query is required"}
 
-    table = (event.get("table") or "").strip()
-    if not table:
-        return {"error": "table is required"}
+    if _MUTATION_PATTERN.search(query):
+        return {"error": "Only read-only SELECT queries are permitted"}
 
-    # Sanitize schema and table names — alphanumeric + underscore only
-    if not _SAFE_IDENTIFIER.match(schema):
-        return {"error": "invalid table name"}
-    if not _SAFE_IDENTIFIER.match(table):
-        return {"error": "invalid table name"}
+    params = event.get("params") or []
+    if not isinstance(params, list):
+        return {"error": "params must be a list"}
 
     try:
-        max_rows = int(event.get("max_rows", 5))
+        max_rows = min(int(event.get("max_rows", 100)), _MAX_ROWS)
     except (TypeError, ValueError):
-        max_rows = 5
-    max_rows = min(max(1, max_rows), 25)
+        max_rows = 100
 
     caller_arn = (event.get("caller_secret_arn") or "").strip()
     resolved_arn: str | None = None
@@ -131,19 +144,31 @@ def handler(event: dict, context: Any) -> dict:
     database = config.get("database", "")
     secret_arn = config.get("secret_arn", "")
 
-    sql = f'SELECT * FROM "{schema}"."{table}" LIMIT {max_rows}'
+    # Rewrite ? → $1, $2, ... for Redshift
+    rewritten_query, _ = _replace_placeholders(query, params)
+
+    # Append LIMIT if absent
+    if not re.search(r"\bLIMIT\b", rewritten_query, re.IGNORECASE):
+        rewritten_query = f"{rewritten_query} LIMIT {max_rows}"
+
+    # Build SQL parameters for Redshift Data API
+    sql_parameters = [{"name": str(i + 1), "value": str(v)} for i, v in enumerate(params)]
+
+    exec_kwargs: dict[str, Any] = {
+        "WorkgroupName": workgroup,
+        "Database": database,
+        "SecretArn": secret_arn,
+        "Sql": rewritten_query,
+    }
+    if sql_parameters:
+        exec_kwargs["Parameters"] = sql_parameters
 
     try:
-        exec_resp = redshift_data.execute_statement(
-            WorkgroupName=workgroup,
-            Database=database,
-            SecretArn=secret_arn,
-            Sql=sql,
-        )
+        exec_resp = redshift_data.execute_statement(**exec_kwargs)
         statement_id = exec_resp["Id"]
     except Exception as e:
         logger.error(json.dumps({"redshift_error": str(e)}))
-        return {"error": f"Redshift execute failed: {e}"}
+        return {"error": "Redshift query could not be submitted"}
 
     try:
         final = _poll_statement(statement_id)
@@ -151,48 +176,41 @@ def handler(event: dict, context: Any) -> dict:
         return {"error": "Redshift query timed out"}
     except Exception as e:
         logger.error(json.dumps({"poll_error": str(e)}))
-        return {"error": f"Redshift poll failed: {e}"}
+        return {"error": "Redshift query status check failed"}
 
     status = final.get("Status", "")
     if status in ("FAILED", "ABORTED"):
-        err = final.get("Error", "unknown error")
-        return {"error": f"Redshift query failed: {err}"}
+        logger.error(json.dumps({"redshift_query_status": status, "detail": final.get("Error", "")}))
+        return {"error": "Redshift query failed"}
 
     try:
         result = redshift_data.get_statement_result(Id=statement_id)
     except Exception as e:
         logger.error(json.dumps({"get_result_error": str(e)}))
-        return {"error": f"Redshift get result failed: {e}"}
+        return {"error": "Failed to retrieve Redshift query results"}
 
-    # Extract column names from ColumnMetadata
     column_metadata = result.get("ColumnMetadata", [])
     columns = [col.get("name", f"col{i}") for i, col in enumerate(column_metadata)]
 
     records = result.get("Records", [])
-
-    # Infer columns from first row if metadata not available
     if not columns and records:
         columns = [f"col{i}" for i in range(len(records[0]))]
 
-    sample_rows = []
-    for row in records:
+    rows = []
+    for row in records[:max_rows]:
         row_dict = {}
         for i, cell in enumerate(row):
             col_name = columns[i] if i < len(columns) else f"col{i}"
-            # Redshift data API returns cells as {type: value} dicts
             val = None
             for cell_val in cell.values():
                 val = cell_val
                 break
             row_dict[col_name] = val
-        sample_rows.append(row_dict)
+        rows.append(row_dict)
 
     return {
-        "source_id": source_id,
-        "schema": schema,
-        "table": table,
+        "connection_id": connection_id,
         "columns": columns,
-        "sample_rows": sample_rows,
-        "row_count": len(sample_rows),
-        "format": "redshift",
+        "rows": rows,
+        "row_count": len(rows),
     }

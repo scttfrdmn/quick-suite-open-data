@@ -254,3 +254,181 @@ class TestSnowflakePreview:
         )
         assert "error" in result
         assert "not configured" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# snowflake-query tests (#35 — parameterized SQL execution)
+# ---------------------------------------------------------------------------
+
+def _load_query():
+    path = os.path.join(REPO_ROOT, "lambdas", "snowflake-query", "handler.py")
+    alias = "_sf_query_handler"
+    spec = importlib.util.spec_from_file_location(alias, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = mod
+    with patch.dict(os.environ, {"SNOWFLAKE_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123:secret:sf"}):
+        spec.loader.exec_module(mod)
+    return mod
+
+
+sf_query = _load_query()
+
+_QUERY_RESULT = {
+    "resultSetMetaData": {
+        "rowType": [{"name": "id"}, {"name": "name"}, {"name": "total"}]
+    },
+    "data": [
+        ["1", "Alice", "99.99"],
+        ["2", "Bob", "49.50"],
+    ],
+}
+
+
+class TestSnowflakeQuery:
+
+    def _mock_secret_q(self):
+        mock_sc = MagicMock()
+        mock_sc.get_secret_value.return_value = {"SecretString": json.dumps(_SNOWFLAKE_SECRET)}
+        return patch.object(sf_query, "secrets_client", mock_sc)
+
+    def test_happy_path_returns_rows_and_columns(self):
+        url_resp = _make_urlopen_response(_QUERY_RESULT)
+        with self._mock_secret_q():
+            with patch("urllib.request.urlopen", return_value=url_resp):
+                result = sf_query.handler(
+                    {"connection_id": "sf-prod", "query": "SELECT id, name, total FROM orders"},
+                    None,
+                )
+        assert "error" not in result
+        assert result["connection_id"] == "sf-prod"
+        assert result["columns"] == ["id", "name", "total"]
+        assert len(result["rows"]) == 2
+        assert result["rows"][0]["name"] == "Alice"
+        assert result["row_count"] == 2
+
+    def test_connection_id_required(self):
+        with self._mock_secret_q():
+            result = sf_query.handler({"query": "SELECT 1"}, None)
+        assert "error" in result
+        assert "connection_id" in result["error"]
+
+    def test_query_required(self):
+        with self._mock_secret_q():
+            result = sf_query.handler({"connection_id": "sf-prod"}, None)
+        assert "error" in result
+        assert "query" in result["error"]
+
+    def test_mutation_insert_rejected(self):
+        with self._mock_secret_q():
+            result = sf_query.handler(
+                {"connection_id": "sf-prod", "query": "INSERT INTO t VALUES (1)"},
+                None,
+            )
+        assert "error" in result
+        assert "read-only" in result["error"].lower()
+
+    def test_mutation_update_rejected(self):
+        with self._mock_secret_q():
+            result = sf_query.handler(
+                {"connection_id": "sf-prod", "query": "UPDATE t SET x=1"},
+                None,
+            )
+        assert "error" in result
+
+    def test_mutation_drop_rejected(self):
+        with self._mock_secret_q():
+            result = sf_query.handler(
+                {"connection_id": "sf-prod", "query": "DROP TABLE orders"},
+                None,
+            )
+        assert "error" in result
+
+    def test_mutation_alter_rejected(self):
+        with self._mock_secret_q():
+            result = sf_query.handler(
+                {"connection_id": "sf-prod", "query": "ALTER TABLE t ADD COLUMN x INT"},
+                None,
+            )
+        assert "error" in result
+
+    def test_select_passes_mutation_check(self):
+        url_resp = _make_urlopen_response(_QUERY_RESULT)
+        with self._mock_secret_q():
+            with patch("urllib.request.urlopen", return_value=url_resp):
+                result = sf_query.handler(
+                    {"connection_id": "sf-prod", "query": "SELECT * FROM t"},
+                    None,
+                )
+        assert "error" not in result
+
+    def test_params_sent_as_bindings(self):
+        url_resp = _make_urlopen_response(_QUERY_RESULT)
+        with self._mock_secret_q():
+            with patch("urllib.request.urlopen", return_value=url_resp) as mock_url:
+                sf_query.handler(
+                    {"connection_id": "sf-prod",
+                     "query": "SELECT * FROM t WHERE id = ?",
+                     "params": [42]},
+                    None,
+                )
+        body = json.loads(mock_url.call_args[0][0].data.decode("utf-8"))
+        assert "bindings" in body
+        assert body["bindings"]["1"]["value"] == "42"
+        assert body["bindings"]["1"]["type"] == "FIXED"
+
+    def test_string_param_type_text(self):
+        url_resp = _make_urlopen_response(_QUERY_RESULT)
+        with self._mock_secret_q():
+            with patch("urllib.request.urlopen", return_value=url_resp) as mock_url:
+                sf_query.handler(
+                    {"connection_id": "sf-prod",
+                     "query": "SELECT * FROM t WHERE name = ?",
+                     "params": ["Alice"]},
+                    None,
+                )
+        body = json.loads(mock_url.call_args[0][0].data.decode("utf-8"))
+        assert body["bindings"]["1"]["type"] == "TEXT"
+        assert body["bindings"]["1"]["value"] == "Alice"
+
+    def test_limit_appended_when_absent(self):
+        url_resp = _make_urlopen_response(_QUERY_RESULT)
+        with self._mock_secret_q():
+            with patch("urllib.request.urlopen", return_value=url_resp) as mock_url:
+                sf_query.handler(
+                    {"connection_id": "sf-prod", "query": "SELECT * FROM t"},
+                    None,
+                )
+        body = json.loads(mock_url.call_args[0][0].data.decode("utf-8"))
+        assert "LIMIT" in body["statement"]
+
+    def test_max_rows_capped_at_1000(self):
+        url_resp = _make_urlopen_response(_QUERY_RESULT)
+        with self._mock_secret_q():
+            with patch("urllib.request.urlopen", return_value=url_resp) as mock_url:
+                sf_query.handler(
+                    {"connection_id": "sf-prod", "query": "SELECT * FROM t", "max_rows": 9999},
+                    None,
+                )
+        body = json.loads(mock_url.call_args[0][0].data.decode("utf-8"))
+        assert "LIMIT 1000" in body["statement"]
+
+    def test_params_must_be_list(self):
+        with self._mock_secret_q():
+            result = sf_query.handler(
+                {"connection_id": "sf-prod", "query": "SELECT 1", "params": "not-a-list"},
+                None,
+            )
+        assert "error" in result
+        assert "list" in result["error"]
+
+    def test_missing_secret_returns_error(self):
+        path = os.path.join(REPO_ROOT, "lambdas", "snowflake-query", "handler.py")
+        alias = "_sf_query_no_secret"
+        spec = importlib.util.spec_from_file_location(alias, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[alias] = mod
+        with patch.dict(os.environ, {"SNOWFLAKE_SECRET_ARN": ""}):
+            spec.loader.exec_module(mod)
+        result = mod.handler({"connection_id": "sf", "query": "SELECT 1"}, None)
+        assert "error" in result
+        assert "not configured" in result["error"]

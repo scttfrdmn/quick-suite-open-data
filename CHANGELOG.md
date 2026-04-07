@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-04-07
+
+### Security
+- **Issue #40: Per-caller credential isolation** — `snowflake_browse`, `snowflake_preview`, `redshift_browse`, `redshift_preview` now accept an optional `caller_secret_arn` parameter. When present, credentials are fetched from the caller-specified Secrets Manager secret instead of the shared service account. ARN format is validated (`arn:aws:secretsmanager:...`) and the ARN must start with a prefix in the `CALLER_SECRETS_ALLOWED_ARNS` env var (comma-separated). When the env var is empty or the ARN doesn't match any prefix, the request is rejected with a "not permitted" error. When `caller_secret_arn` is absent, the shared service account secret is used (backward compatible).
+
+### Added
+- **Issue #35: `snowflake_query` tool** — New AgentCore Lambda target (`lambdas/snowflake-query/handler.py`). Accepts `connection_id`, `query` (parameterized SQL with `?` placeholders), `params` (list of bind values), and optional `max_rows` (default 100, max 1000). Uses Snowflake SQL API v2 positional bindings. Mutations (INSERT/UPDATE/DELETE/DROP/CREATE/TRUNCATE/ALTER/MERGE) are rejected. `LIMIT` is appended automatically when absent. Also accepts `caller_secret_arn` with the same allowlist semantics as #40.
+- **Issue #36: `redshift_query` tool** — New AgentCore Lambda target (`lambdas/redshift-query/handler.py`). Accepts `connection_id`, `query` (parameterized SQL with `?` placeholders), `params`, and optional `max_rows` (default 100, max 1000). Rewrites `?` placeholders to `$1`, `$2`, ... for Redshift Data API. Uses async `ExecuteStatement` → `DescribeStatement` → `GetStatementResult` pattern. Same mutation detection and `LIMIT` injection as #35. Also accepts `caller_secret_arn`.
+
+### Tests
+- 14 new tests in `test_security.py`: `TestCallerSecretIsolation` — ARN validation, allowlist enforcement, handler-level rejection, shared-secret fallback, caller-secret fetch for snowflake-browse
+- 14 new tests in `test_snowflake_tools.py`: `TestSnowflakeQuery` — happy path, input validation, mutation detection, bindings, LIMIT injection, max_rows cap
+- 16 new tests in `test_redshift_tools.py`: `TestRedshiftQuery` — happy path, input validation, mutation detection, `?` → `$N` rewriting, Parameters, LIMIT injection, max_rows cap, failed statement
+
 ## [0.8.0] - 2026-04-06
 
 ### Fixed

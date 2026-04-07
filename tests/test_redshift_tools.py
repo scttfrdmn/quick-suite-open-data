@@ -372,3 +372,208 @@ class TestRedshiftPreviewResultParsing:
 
         assert "error" in result
         assert "Redshift query failed" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# redshift-query tests (#36 — parameterized SQL execution)
+# ---------------------------------------------------------------------------
+
+_QUERY_COLUMN_METADATA = [{"name": "id"}, {"name": "name"}, {"name": "total"}]
+_QUERY_RECORDS = [
+    [{"stringValue": "1"}, {"stringValue": "Alice"}, {"stringValue": "99.99"}],
+    [{"stringValue": "2"}, {"stringValue": "Bob"}, {"stringValue": "49.50"}],
+]
+
+
+def _load_rs_query():
+    path = os.path.join(REPO_ROOT, "lambdas", "redshift-query", "handler.py")
+    alias = "_rs_query_handler"
+    spec = importlib.util.spec_from_file_location(alias, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = mod
+    with patch.dict(os.environ, {"REDSHIFT_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123:secret:rs"}):
+        spec.loader.exec_module(mod)
+    return mod
+
+
+rs_query = _load_rs_query()
+
+
+def _mock_rs_query(mod, statement_id="stmt-001", status="FINISHED",
+                   column_metadata=None, records=None):
+    """Build a mock sfn client that returns a complete successful query lifecycle."""
+    mock_sm = MagicMock()
+    mock_sm.get_secret_value.return_value = {
+        "SecretString": json.dumps(_REDSHIFT_SECRET)
+    }
+    mock_rdq = MagicMock()
+    mock_rdq.execute_statement.return_value = {"Id": statement_id}
+    mock_rdq.describe_statement.return_value = {"Status": status}
+    mock_rdq.get_statement_result.return_value = {
+        "ColumnMetadata": column_metadata or _QUERY_COLUMN_METADATA,
+        "Records": records or _QUERY_RECORDS,
+    }
+    return mock_sm, mock_rdq
+
+
+class TestRedshiftQuery:
+
+    def test_happy_path_returns_rows_and_columns(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query)
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq), \
+             patch.object(rs_query, "REDSHIFT_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:rs"):
+            result = rs_query.handler(
+                {"connection_id": "rs-prod", "query": "SELECT id, name, total FROM orders"},
+                None,
+            )
+        assert "error" not in result
+        assert result["connection_id"] == "rs-prod"
+        assert result["columns"] == ["id", "name", "total"]
+        assert len(result["rows"]) == 2
+        assert result["rows"][0]["name"] == "Alice"
+        assert result["row_count"] == 2
+
+    def test_connection_id_required(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query)
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq):
+            result = rs_query.handler({"query": "SELECT 1"}, None)
+        assert "error" in result
+        assert "connection_id" in result["error"]
+
+    def test_query_required(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query)
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq):
+            result = rs_query.handler({"connection_id": "rs-prod"}, None)
+        assert "error" in result
+        assert "query" in result["error"]
+
+    def test_mutation_insert_rejected(self):
+        result = rs_query.handler(
+            {"connection_id": "rs-prod", "query": "INSERT INTO t VALUES (1)"},
+            None,
+        )
+        assert "error" in result
+        assert "read-only" in result["error"].lower()
+
+    def test_mutation_delete_rejected(self):
+        result = rs_query.handler(
+            {"connection_id": "rs-prod", "query": "DELETE FROM t WHERE id=1"},
+            None,
+        )
+        assert "error" in result
+
+    def test_mutation_drop_rejected(self):
+        result = rs_query.handler(
+            {"connection_id": "rs-prod", "query": "DROP TABLE orders"},
+            None,
+        )
+        assert "error" in result
+
+    def test_mutation_truncate_rejected(self):
+        result = rs_query.handler(
+            {"connection_id": "rs-prod", "query": "TRUNCATE orders"},
+            None,
+        )
+        assert "error" in result
+
+    def test_select_passes_mutation_check(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query)
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq), \
+             patch.object(rs_query, "REDSHIFT_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:rs"):
+            result = rs_query.handler(
+                {"connection_id": "rs-prod", "query": "SELECT * FROM t"},
+                None,
+            )
+        assert "error" not in result
+
+    def test_question_mark_placeholders_rewritten_to_positional(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query)
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq), \
+             patch.object(rs_query, "REDSHIFT_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:rs"):
+            rs_query.handler(
+                {"connection_id": "rs-prod",
+                 "query": "SELECT * FROM t WHERE id = ? AND name = ?",
+                 "params": [1, "Alice"]},
+                None,
+            )
+        call_kwargs = mock_rdq.execute_statement.call_args[1]
+        assert "$1" in call_kwargs["Sql"]
+        assert "$2" in call_kwargs["Sql"]
+        assert "?" not in call_kwargs["Sql"]
+
+    def test_params_sent_as_sql_parameters(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query)
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq), \
+             patch.object(rs_query, "REDSHIFT_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:rs"):
+            rs_query.handler(
+                {"connection_id": "rs-prod",
+                 "query": "SELECT * FROM t WHERE id = ?",
+                 "params": [42]},
+                None,
+            )
+        call_kwargs = mock_rdq.execute_statement.call_args[1]
+        assert "Parameters" in call_kwargs
+        assert call_kwargs["Parameters"][0]["value"] == "42"
+
+    def test_limit_appended_when_absent(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query)
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq), \
+             patch.object(rs_query, "REDSHIFT_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:rs"):
+            rs_query.handler(
+                {"connection_id": "rs-prod", "query": "SELECT * FROM t"},
+                None,
+            )
+        call_kwargs = mock_rdq.execute_statement.call_args[1]
+        assert "LIMIT" in call_kwargs["Sql"]
+
+    def test_max_rows_capped_at_1000(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query)
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq), \
+             patch.object(rs_query, "REDSHIFT_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:rs"):
+            rs_query.handler(
+                {"connection_id": "rs-prod", "query": "SELECT * FROM t", "max_rows": 9999},
+                None,
+            )
+        call_kwargs = mock_rdq.execute_statement.call_args[1]
+        assert "LIMIT 1000" in call_kwargs["Sql"]
+
+    def test_params_must_be_list(self):
+        result = rs_query.handler(
+            {"connection_id": "rs-prod", "query": "SELECT 1", "params": "not-a-list"},
+            None,
+        )
+        assert "error" in result
+        assert "list" in result["error"]
+
+    def test_failed_statement_returns_error(self):
+        mock_sm, mock_rdq = _mock_rs_query(rs_query, status="FAILED")
+        mock_rdq.describe_statement.return_value = {"Status": "FAILED", "Error": "Query failed"}
+        with patch.object(rs_query, "secrets_client", mock_sm), \
+             patch.object(rs_query, "redshift_data", mock_rdq), \
+             patch.object(rs_query, "REDSHIFT_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:rs"):
+            result = rs_query.handler(
+                {"connection_id": "rs-prod", "query": "SELECT * FROM t"},
+                None,
+            )
+        assert "error" in result
+        assert "failed" in result["error"].lower()
+
+    def test_missing_secret_returns_error(self):
+        path = os.path.join(REPO_ROOT, "lambdas", "redshift-query", "handler.py")
+        alias = "_rs_query_no_secret"
+        spec = importlib.util.spec_from_file_location(alias, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[alias] = mod
+        with patch.dict(os.environ, {"REDSHIFT_SECRET_ARN": ""}):
+            spec.loader.exec_module(mod)
+        result = mod.handler({"connection_id": "rs", "query": "SELECT 1"}, None)
+        assert "error" in result
+        assert "not configured" in result["error"]

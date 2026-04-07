@@ -397,3 +397,184 @@ class TestErrorSanitization:
         assert "myaccount" not in result["error"]
         assert "Incorrect username" not in result["error"]
         assert "Snowflake query failed" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# #40 — Per-caller credential isolation (caller_secret_arn)
+# ---------------------------------------------------------------------------
+
+_VALID_CALLER_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:caller-creds-abc123"
+_ALLOWED_PREFIX = "arn:aws:secretsmanager:us-east-1:123456789012:secret:caller-"
+
+
+class TestCallerSecretIsolation:
+    """
+    caller_secret_arn parameter on browse/preview handlers uses caller creds
+    instead of the shared service account, subject to allowlist validation.
+    """
+
+    def _sf_browse(self, allowed_arns: str = "") -> object:
+        return _load(
+            "lambdas/snowflake-browse/handler.py",
+            f"_sf_browse_caller_{id(allowed_arns)}",
+            env={"SNOWFLAKE_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123:secret:shared",
+                 "CALLER_SECRETS_ALLOWED_ARNS": allowed_arns},
+        )
+
+    def _sf_preview(self, allowed_arns: str = "") -> object:
+        return _load(
+            "lambdas/snowflake-preview/handler.py",
+            f"_sf_preview_caller_{id(allowed_arns)}",
+            env={"SNOWFLAKE_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123:secret:shared",
+                 "CALLER_SECRETS_ALLOWED_ARNS": allowed_arns},
+        )
+
+    def _rs_browse(self, allowed_arns: str = "") -> object:
+        return _load(
+            "lambdas/redshift-browse/handler.py",
+            f"_rs_browse_caller_{id(allowed_arns)}",
+            env={"REDSHIFT_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123:secret:shared",
+                 "CALLER_SECRETS_ALLOWED_ARNS": allowed_arns},
+        )
+
+    def _rs_preview(self, allowed_arns: str = "") -> object:
+        return _load(
+            "lambdas/redshift-preview/handler.py",
+            f"_rs_preview_caller_{id(allowed_arns)}",
+            env={"REDSHIFT_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123:secret:shared",
+                 "CALLER_SECRETS_ALLOWED_ARNS": allowed_arns},
+        )
+
+    # ---- _resolve_caller_secret_arn unit tests (using snowflake-browse as representative) ----
+
+    def test_valid_arn_with_allowlist_accepted(self):
+        mod = self._sf_browse(_ALLOWED_PREFIX)
+        assert mod._resolve_caller_secret_arn(_VALID_CALLER_ARN) == _VALID_CALLER_ARN
+
+    def test_invalid_arn_format_rejected(self):
+        mod = self._sf_browse(_ALLOWED_PREFIX)
+        assert mod._resolve_caller_secret_arn("not-an-arn") is None
+
+    def test_arn_not_in_allowlist_rejected(self):
+        mod = self._sf_browse("arn:aws:secretsmanager:us-east-1:999:secret:other-")
+        assert mod._resolve_caller_secret_arn(_VALID_CALLER_ARN) is None
+
+    def test_empty_allowlist_rejects_all_caller_arns(self):
+        """When CALLER_SECRETS_ALLOWED_ARNS is empty, no caller ARN is permitted."""
+        mod = self._sf_browse("")
+        assert mod._resolve_caller_secret_arn(_VALID_CALLER_ARN) is None
+
+    def test_iam_arn_not_accepted_as_secret_arn(self):
+        mod = self._sf_browse(_ALLOWED_PREFIX)
+        assert mod._resolve_caller_secret_arn("arn:aws:iam::123:user/alice") is None
+
+    # ---- Integration: handler rejects disallowed caller_secret_arn ----
+
+    def test_sf_browse_disallowed_caller_arn_returns_error(self):
+        mod = self._sf_browse("")  # no allowlist
+        result = mod.handler(
+            {"source_id": "sf-prod", "caller_secret_arn": _VALID_CALLER_ARN},
+            _FakeContext(),
+        )
+        assert "error" in result
+        assert "not permitted" in result["error"]
+
+    def test_sf_preview_disallowed_caller_arn_returns_error(self):
+        mod = self._sf_preview("")
+        result = mod.handler(
+            {"source_id": "sf-prod", "schema": "PUBLIC", "table": "T",
+             "caller_secret_arn": _VALID_CALLER_ARN},
+            _FakeContext(),
+        )
+        assert "error" in result
+        assert "not permitted" in result["error"]
+
+    def test_rs_browse_disallowed_caller_arn_returns_error(self):
+        mod = self._rs_browse("")
+        result = mod.handler(
+            {"source_id": "rs-prod", "caller_secret_arn": _VALID_CALLER_ARN},
+            _FakeContext(),
+        )
+        assert "error" in result
+        assert "not permitted" in result["error"]
+
+    def test_rs_preview_disallowed_caller_arn_returns_error(self):
+        mod = self._rs_preview("")
+        result = mod.handler(
+            {"source_id": "rs-prod", "schema": "public", "table": "orders",
+             "caller_secret_arn": _VALID_CALLER_ARN},
+            _FakeContext(),
+        )
+        assert "error" in result
+        assert "not permitted" in result["error"]
+
+    # ---- Integration: allowed caller_secret_arn fetches that secret ----
+
+    def test_sf_browse_allowed_caller_arn_uses_caller_secret(self):
+        import json as _json
+        from io import BytesIO as _BIO
+        from unittest.mock import MagicMock as _MM
+
+        mod = self._sf_browse(_ALLOWED_PREFIX)
+
+        mock_sm = _MM()
+        # shared secret
+        shared_cfg = {"account": "shared-acct", "user": "u", "password": "p", "warehouse": "w"}
+        # caller secret
+        caller_cfg = {"account": "caller-acct", "user": "cu", "password": "cp", "warehouse": "cw"}
+
+        def get_secret(SecretId):
+            if SecretId == _VALID_CALLER_ARN:
+                return {"SecretString": _json.dumps(caller_cfg)}
+            return {"SecretString": _json.dumps(shared_cfg)}
+
+        mock_sm.get_secret_value.side_effect = get_secret
+
+        mock_resp = _MM()
+        mock_resp.read.return_value = _json.dumps({"data": []}).encode()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = _MM(return_value=False)
+
+        captured_urls = []
+
+        def fake_urlopen(req, timeout=30):
+            captured_urls.append(req.full_url if hasattr(req, "full_url") else str(req))
+            return mock_resp
+
+        with patch.object(mod, "secrets_client", mock_sm):
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                result = mod.handler(
+                    {"source_id": "sf-prod", "caller_secret_arn": _VALID_CALLER_ARN},
+                    _FakeContext(),
+                )
+
+        # Verify the caller secret was fetched (not the shared one)
+        mock_sm.get_secret_value.assert_called_with(SecretId=_VALID_CALLER_ARN)
+        # URL should use caller-acct
+        assert any("caller-acct" in u for u in captured_urls)
+
+    def test_absent_caller_arn_uses_shared_secret(self):
+        """When caller_secret_arn is absent, the shared secret is used."""
+        import json as _json
+        from io import BytesIO as _BIO
+        from unittest.mock import MagicMock as _MM
+
+        mod = self._sf_browse(_ALLOWED_PREFIX)
+
+        mock_sm = _MM()
+        shared_cfg = {"account": "shared-acct", "user": "u", "password": "p", "warehouse": "w"}
+        mock_sm.get_secret_value.return_value = {"SecretString": _json.dumps(shared_cfg)}
+
+        mock_resp = _MM()
+        mock_resp.read.return_value = _json.dumps({"data": []}).encode()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = _MM(return_value=False)
+
+        with patch.object(mod, "secrets_client", mock_sm), \
+             patch.object(mod, "SNOWFLAKE_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:shared"), \
+             patch("urllib.request.urlopen", return_value=mock_resp):
+            result = mod.handler({"source_id": "sf-prod"}, _FakeContext())
+
+        mock_sm.get_secret_value.assert_called_with(
+            SecretId="arn:aws:secretsmanager:us-east-1:123:secret:shared"
+        )

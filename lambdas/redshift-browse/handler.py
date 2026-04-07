@@ -10,6 +10,7 @@ Uses boto3 redshift-data client.
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -22,17 +23,35 @@ secrets_client = boto3.client("secretsmanager")
 redshift_data = boto3.client("redshift-data")
 
 REDSHIFT_SECRET_ARN = os.environ.get("REDSHIFT_SECRET_ARN", "")
+CALLER_SECRETS_ALLOWED_ARNS: list[str] = [
+    p.strip()
+    for p in os.environ.get("CALLER_SECRETS_ALLOWED_ARNS", "").split(",")
+    if p.strip()
+]
+_SECRET_ARN_RE = re.compile(r"^arn:aws:secretsmanager:[a-z0-9\-]+:\d{12}:secret:.+$")
 
 _POLL_MAX = 30
 _POLL_INTERVAL = 1
 
 
-def _get_redshift_config() -> dict | None:
+def _resolve_caller_secret_arn(caller_arn: str) -> str | None:
+    """Validate a caller-supplied secret ARN against the allowlist."""
+    if not _SECRET_ARN_RE.match(caller_arn):
+        return None
+    if not CALLER_SECRETS_ALLOWED_ARNS:
+        return None
+    if any(caller_arn.startswith(prefix) for prefix in CALLER_SECRETS_ALLOWED_ARNS):
+        return caller_arn
+    return None
+
+
+def _get_redshift_config(secret_arn: str | None = None) -> dict | None:
     """Fetch Redshift connection config from Secrets Manager. Returns None if not configured."""
-    if not REDSHIFT_SECRET_ARN:
+    arn = secret_arn or REDSHIFT_SECRET_ARN
+    if not arn:
         return None
     try:
-        resp = secrets_client.get_secret_value(SecretId=REDSHIFT_SECRET_ARN)
+        resp = secrets_client.get_secret_value(SecretId=arn)
         return json.loads(resp["SecretString"])
     except Exception as e:
         logger.error(json.dumps({"error": "secrets_manager_error", "detail": str(e)}))
@@ -74,7 +93,14 @@ def handler(event: dict, context: Any) -> dict:
     if not source_id:
         return {"error": "source_id is required"}
 
-    config = _get_redshift_config()
+    caller_arn = (event.get("caller_secret_arn") or "").strip()
+    resolved_arn: str | None = None
+    if caller_arn:
+        resolved_arn = _resolve_caller_secret_arn(caller_arn)
+        if resolved_arn is None:
+            return {"error": "caller_secret_arn is not permitted"}
+
+    config = _get_redshift_config(resolved_arn)
     if config is None:
         return {"error": "Redshift source not configured"}
 
