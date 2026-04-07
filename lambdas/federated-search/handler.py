@@ -288,6 +288,240 @@ def _search_nsf_awards(query_words: list, source: dict) -> list:
     return results
 
 
+def _search_pubmed(query_words: list, source: dict) -> list:
+    """Search PubMed via NCBI E-utilities (public API, no auth)."""
+    query = " ".join(query_words)
+    if not query:
+        return []
+
+    params = {"db": "pubmed", "term": query, "retmax": 20, "retmode": "json"}
+    _eutils = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    esearch_url = f"{_eutils}/esearch.fcgi?" + urllib.parse.urlencode(params)
+    _ua_headers = {"Accept": "application/json", "User-Agent": "quick-suite-data/1.0"}
+    try:
+        req = urllib.request.Request(esearch_url, headers=_ua_headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            esearch_data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        logger.warning(json.dumps({"pubmed_esearch_error": str(e)}))
+        raise
+
+    pmids = esearch_data.get("esearchresult", {}).get("idlist", [])
+    if not pmids:
+        return []
+
+    sum_params = {"db": "pubmed", "id": ",".join(pmids[:20]), "retmode": "json", "version": "2.0"}
+    esummary_url = f"{_eutils}/esummary.fcgi?" + urllib.parse.urlencode(sum_params)
+    try:
+        req2 = urllib.request.Request(esummary_url, headers=_ua_headers)
+        with urllib.request.urlopen(req2, timeout=20) as resp2:
+            sum_data = json.loads(resp2.read().decode("utf-8"))
+    except Exception as e:
+        logger.warning(json.dumps({"pubmed_esummary_error": str(e)}))
+        raise
+
+    result_data = sum_data.get("result", {})
+    uids = result_data.get("uids", pmids)
+    results = []
+    for uid in uids[:20]:
+        item = result_data.get(str(uid))
+        if not item or not isinstance(item, dict):
+            continue
+        title = item.get("title", "")
+        text = title.lower()
+        matches = sum(1 for w in query_words if w in text)
+        score = min(matches / len(query_words), 1.0) if query_words else 0.0
+        if score > 0:
+            results.append({
+                "source_id": source.get("source_id", f"pubmed/{uid}"),
+                "source_type": "pubmed",
+                "display_name": title,
+                "match_score": score,
+                "description": item.get("source", ""),
+                "quality_score": None,
+            })
+    return results
+
+
+def _search_biorxiv(query_words: list, source: dict) -> list:
+    """Search bioRxiv preprints via bioRxiv public API."""
+    from datetime import datetime, timedelta
+    query = " ".join(query_words)
+    if not query:
+        return []
+
+    today = datetime.utcnow().date()
+    date_start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    date_end = today.strftime("%Y-%m-%d")
+    url = f"https://api.biorxiv.org/details/biorxiv/{date_start}/{date_end}/0/json"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/json", "User-Agent": "quick-suite-data/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        logger.warning(json.dumps({"biorxiv_error": str(e)}))
+        raise
+
+    results = []
+    for item in data.get("collection", [])[:20]:
+        title = item.get("title", "")
+        abstract = (item.get("abstract") or "")[:200]
+        text = (title + " " + abstract).lower()
+        matches = sum(1 for w in query_words if w in text)
+        score = min(matches / len(query_words), 1.0) if query_words else 0.0
+        if score > 0:
+            doi = item.get("doi", "")
+            results.append({
+                "source_id": source.get("source_id", f"biorxiv/{doi}"),
+                "source_type": "biorxiv",
+                "display_name": title,
+                "match_score": score,
+                "description": abstract,
+                "quality_score": None,
+            })
+    return results
+
+
+def _search_semantic_scholar(query_words: list, source: dict) -> list:
+    """Search academic papers via Semantic Scholar Graph API (public API)."""
+    query = " ".join(query_words)
+    if not query:
+        return []
+
+    params = {
+        "query": query,
+        "fields": "paperId,title,authors,year,citationCount,abstract",
+        "limit": 20,
+    }
+    url = "https://api.semanticscholar.org/graph/v1/paper/search?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/json", "User-Agent": "quick-suite-data/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        logger.warning(json.dumps({"semantic_scholar_error": str(e)}))
+        raise
+
+    results = []
+    for item in data.get("data", [])[:20]:
+        title = item.get("title", "")
+        abstract = (item.get("abstract") or "")[:200]
+        text = (title + " " + abstract).lower()
+        matches = sum(1 for w in query_words if w in text)
+        score = min(matches / len(query_words), 1.0) if query_words else 0.0
+        if score > 0:
+            paper_id = item.get("paperId", "")
+            results.append({
+                "source_id": source.get("source_id", f"s2/{paper_id}"),
+                "source_type": "semantic_scholar",
+                "display_name": title,
+                "match_score": score,
+                "description": abstract,
+                "quality_score": None,
+            })
+    return results
+
+
+def _search_arxiv(query_words: list, source: dict) -> list:
+    """Search arXiv preprints via the arXiv Atom API."""
+    import xml.etree.ElementTree as ET
+
+    query = " ".join(query_words)
+    if not query:
+        return []
+
+    encoded = urllib.parse.quote_plus(query)
+    url = f"http://export.arxiv.org/api/query?search_query=all:{encoded}&max_results=20"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "quick-suite-data/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            xml_bytes = resp.read()
+    except Exception as e:
+        logger.warning(json.dumps({"arxiv_error": str(e)}))
+        raise
+
+    ns = "{http://www.w3.org/2005/Atom}"
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as e:
+        logger.warning(json.dumps({"arxiv_xml_error": str(e)}))
+        return []
+
+    results = []
+    for entry in root.findall(f"{ns}entry"):
+        title_el = entry.find(f"{ns}title")
+        title = (title_el.text or "").strip() if title_el is not None else ""
+        summary_el = entry.find(f"{ns}summary")
+        summary = (summary_el.text or "").strip() if summary_el is not None else ""
+        text = (title + " " + summary[:200]).lower()
+        matches = sum(1 for w in query_words if w in text)
+        score = min(matches / len(query_words), 1.0) if query_words else 0.0
+        if score > 0:
+            id_el = entry.find(f"{ns}id")
+            id_text = (id_el.text or "").strip() if id_el is not None else ""
+            arxiv_id = id_text.split("/abs/")[-1] if "/abs/" in id_text else id_text
+            results.append({
+                "source_id": source.get("source_id", f"arxiv/{arxiv_id}"),
+                "source_type": "arxiv",
+                "display_name": title,
+                "match_score": score,
+                "description": summary[:200],
+                "quality_score": None,
+            })
+    return results
+
+
+def _search_reagents(query_words: list, source: dict) -> list:
+    """Search reagents — returns empty if no ADDGENE_API_KEY configured."""
+    import os
+    api_key = os.environ.get("ADDGENE_API_KEY", "")
+    if not api_key:
+        logger.info(json.dumps({"reagent_search": "no_api_key_skipping"}))
+        return []
+
+    query = " ".join(query_words)
+    params = {"query": query, "page_size": 20}
+    url = "https://www.addgene.org/api/v2/plasmids/?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Token {api_key}",
+                "User-Agent": "quick-suite-data/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        logger.warning(json.dumps({"reagent_error": str(e)}))
+        raise
+
+    results = []
+    items = data.get("results", data if isinstance(data, list) else [])
+    for item in items[:20]:
+        name = item.get("name", item.get("plasmid_name", ""))
+        description = item.get("description", item.get("purpose", ""))
+        text = (name + " " + description).lower()
+        matches = sum(1 for w in query_words if w in text)
+        score = min(matches / len(query_words), 1.0) if query_words else 0.0
+        if score > 0:
+            reagent_id = str(item.get("id", ""))
+            results.append({
+                "source_id": source.get("source_id", f"reagent/{reagent_id}"),
+                "source_type": "reagents",
+                "display_name": name,
+                "match_score": score,
+                "description": description[:200],
+                "quality_score": None,
+            })
+    return results
+
+
 def _search_redshift(query_words: list, source: dict) -> list:
     """List Redshift tables and match names against query words."""
     import time
@@ -423,6 +657,11 @@ def handler(event: dict, context: Any) -> dict:
         "ipeds": _search_ipeds,
         "nih_reporter": _search_nih_reporter,
         "nsf_awards": _search_nsf_awards,
+        "pubmed": _search_pubmed,
+        "biorxiv": _search_biorxiv,
+        "semantic_scholar": _search_semantic_scholar,
+        "arxiv": _search_arxiv,
+        "reagents": _search_reagents,
     }
 
     for source in sources:

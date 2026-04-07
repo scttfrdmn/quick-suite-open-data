@@ -737,6 +737,76 @@ class OpenDataStack(Stack):
         )
 
         # -----------------------------------------------------------------
+        # Lambda: PubMed Search (AgentCore tool — public API, no secrets)
+        # -----------------------------------------------------------------
+        pubmed_search_fn = lambda_.Function(
+            self,
+            "PubmedSearch",
+            function_name=f"{prefix}-pubmed-search",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/pubmed-search"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: bioRxiv Search (AgentCore tool — public API, no secrets)
+        # -----------------------------------------------------------------
+        biorxiv_search_fn = lambda_.Function(
+            self,
+            "BiorxivSearch",
+            function_name=f"{prefix}-biorxiv-search",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/biorxiv-search"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: Semantic Scholar Search (AgentCore tool — public API)
+        # -----------------------------------------------------------------
+        semantic_scholar_search_fn = lambda_.Function(
+            self,
+            "SemanticScholarSearch",
+            function_name=f"{prefix}-semantic-scholar-search",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/semantic-scholar-search"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: arXiv Search (AgentCore tool — public API, no secrets)
+        # -----------------------------------------------------------------
+        arxiv_search_fn = lambda_.Function(
+            self,
+            "ArxivSearch",
+            function_name=f"{prefix}-arxiv-search",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/arxiv-search"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+        )
+
+        # -----------------------------------------------------------------
+        # Lambda: Reagent Search (AgentCore tool — Addgene API key optional)
+        # -----------------------------------------------------------------
+        reagent_search_fn = lambda_.Function(
+            self,
+            "ReagentSearch",
+            function_name=f"{prefix}-reagent-search",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/reagent-search"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+        )
+
+        # -----------------------------------------------------------------
         # Lambda: Federated Search (AgentCore tool)
         # -----------------------------------------------------------------
         federated_search_fn = lambda_.Function(
@@ -788,6 +858,11 @@ class OpenDataStack(Stack):
             ipeds_search_fn,
             nih_reporter_search_fn,
             nsf_awards_search_fn,
+            pubmed_search_fn,
+            biorxiv_search_fn,
+            semantic_scholar_search_fn,
+            arxiv_search_fn,
+            reagent_search_fn,
         ]
         if gateway_role_arn:
             for fn in [search_fn, loader_fn, browse_fn, preview_fn, s3_load_fn] + _new_tool_fns:
@@ -808,6 +883,8 @@ class OpenDataStack(Stack):
                 redshift_browse_fn, redshift_preview_fn,
                 federated_search_fn,
                 ipeds_search_fn, nih_reporter_search_fn, nsf_awards_search_fn,
+                pubmed_search_fn, biorxiv_search_fn, semantic_scholar_search_fn,
+                arxiv_search_fn, reagent_search_fn,
             ]
             for fn in _all_lambda_fns:
                 cmk.grant(fn.grant_principal, "kms:Decrypt", "kms:GenerateDataKey")
@@ -829,6 +906,11 @@ class OpenDataStack(Stack):
             "ipeds_search": ipeds_search_fn.function_arn,
             "nih_reporter_search": nih_reporter_search_fn.function_arn,
             "nsf_awards_search": nsf_awards_search_fn.function_arn,
+            "pubmed_search": pubmed_search_fn.function_arn,
+            "biorxiv_search": biorxiv_search_fn.function_arn,
+            "semantic_scholar_search": semantic_scholar_search_fn.function_arn,
+            "arxiv_search": arxiv_search_fn.function_arn,
+            "reagent_search": reagent_search_fn.function_arn,
         }
 
         for tool_name, arn_value in tool_arns.items():

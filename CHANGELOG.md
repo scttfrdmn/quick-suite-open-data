@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-07
+
+### Added
+- **Issue #44: `pubmed_search` tool** — New AgentCore Lambda target (`lambdas/pubmed-search/handler.py`). Searches PubMed via NCBI E-utilities two-step flow (esearch → esummary, JSON). Optional `NCBI_API_KEY` env var raises rate limit from 3 to 10 req/s. Accepts `query`, `date_start`, `date_end`, `pub_type_filter`, `max_results` (default 20, max 50). Returns `pmid`, `title`, `authors`, `journal`, `pub_date`, `quality_score` (recency decay), `source_type: "pubmed"`.
+- **Issue #45: `biorxiv_search` tool** — New AgentCore Lambda target (`lambdas/biorxiv-search/handler.py`). Searches bioRxiv and/or medRxiv via the biorxiv.org details API. `server` param supports `biorxiv`, `medrxiv`, or `both` (two concurrent calls merged). Defaults to last 30 days when no date range given. Returns `doi`, `title`, `authors`, `category`, `date`, `abstract` (500 char cap), `source_type: "biorxiv"/"medrxiv"`.
+- **Issue #47: `semantic_scholar_search` tool** — New AgentCore Lambda target (`lambdas/semantic-scholar-search/handler.py`). Queries Semantic Scholar Graph API v1. Optional `SEMANTIC_SCHOLAR_API_KEY` env var. Client-side `min_citations`, `year_start`/`year_end`, `fields_of_study` filters. Returns `paper_id`, `title`, `authors`, `year`, `citation_count`, `fields_of_study`, `abstract` (500 char cap), `quality_score` (citation+recency blend).
+- **Issue #48: `arxiv_search` tool** — New AgentCore Lambda target (`lambdas/arxiv-search/handler.py`). Queries arXiv Atom API, parses XML with `xml.etree.ElementTree`. Client-side `category_filter`. Respects arXiv ToS 1 req/3s guideline (comment in code). Returns `arxiv_id`, `title`, `authors`, `published`, `summary` (500 char cap), `categories`.
+- **Issue #46: `reagent_search` tool** — New AgentCore Lambda target (`lambdas/reagent-search/handler.py`). Queries Addgene catalog API v2. Returns informational `note` field when `ADDGENE_API_KEY` env var is not configured. `reagent_type` filter (plasmid|cell_line|bacteria|all). Returns `reagent_id`, `reagent_type`, `name`, `organism`, `description`, `catalog_url`.
+- **federated_search dispatch extensions** — `_search_pubmed()`, `_search_biorxiv()`, `_search_semantic_scholar()`, `_search_arxiv()`, `_search_reagents()` added to `lambdas/federated-search/handler.py`; registered in `_search_fn` dict.
+- **CDK** — Five new Lambda constructs added to `stacks/open_data_stack.py`; included in `_new_tool_fns`, KMS grant list, and `tool_arns` CloudFormation output.
+- **Issue #49: `docs/adding-sources.md`** — Contributor guide covering: source interface contract, auth patterns (open/API key/Secrets Manager), quality score guidelines, testing skeleton, Lambda + CDK wiring walkthrough.
+
+### Tests
+- 38 new tests in `tests/test_literature_sources.py`:
+  - `TestPubMedSearch` (7): happy path, date filter, max_results capped, esearch error returns empty, esummary error returns empty, empty query returns error, NCBI_API_KEY added to URL
+  - `TestBiorxivSearch` (7): happy path with matching records, server=both makes two calls, date filter included in URL, empty collection, non-matching query returns empty, empty query returns error, abstract truncated
+  - `TestSemanticScholarSearch` (7): happy path, min_citations filter, fields_of_study in params, year filter, empty results, API error, empty query returns error
+  - `TestArxivSearch` (6): happy path with XML parsing, category_filter applied, date range in URL, empty feed, XML parse error returns empty, empty query returns error
+  - `TestReagentSearch` (5): no API key returns note, API key set queries endpoint, reagent_type in params, organism_filter, empty query returns error
+  - `TestFederatedSearchLiteratureSources` (6): pubmed dispatch, biorxiv dispatch, semantic_scholar dispatch, arxiv dispatch, reagents dispatch, unknown type skipped
+
 ## [0.10.0] - 2026-04-07
 
 ### Added
