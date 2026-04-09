@@ -555,6 +555,23 @@ class OpenDataStack(Stack):
             **_ddb_kms_kwargs,
         )
 
+        # clAWS memory registry table (v0.12.0 — stores QuickSight dataset IDs for memory files)
+        memory_registry_table = dynamodb.Table(
+            self,
+            "ClawsMemoryRegistryTable",
+            table_name="qs-claws-memory-registry",
+            partition_key=dynamodb.Attribute(
+                name="user_arn_hash", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="dataset_type", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.RETAIN,
+            point_in_time_recovery=True,
+            deletion_protection=True,
+        )
+
         # CDK migration flag — when true, s3-browse loads sources from DynamoDB
         use_source_registry = self.node.try_get_context("use_source_registry") or False
         if use_source_registry:
@@ -600,6 +617,54 @@ class OpenDataStack(Stack):
                 principal=iam.ArnPrincipal(register_source_admin_arn),
                 action="lambda:InvokeFunction",
             )
+
+        # -----------------------------------------------------------------
+        # Lambda: Register Memory Source (internal — not an AgentCore tool, v0.12.0)
+        # -----------------------------------------------------------------
+        memory_bucket_arn = self.node.try_get_context("memory_bucket_arn") or ""
+
+        memory_registrar_fn = lambda_.Function(
+            self,
+            "MemoryRegistrarFn",
+            function_name="qs-data-memory-registrar",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/memory"),
+            memory_size=128,
+            timeout=Duration.seconds(30),
+            environment={
+                "REGISTRY_TABLE": memory_registry_table.table_name,
+                "MANIFEST_BUCKET": manifest_bucket.bucket_name,
+                "QUICKSIGHT_ACCOUNT_ID": account_id,
+                "QUICKSIGHT_REGION": qs_region,
+                "QUICKSIGHT_USER": qs_user,
+            },
+        )
+        memory_registry_table.grant_read_write_data(memory_registrar_fn)
+        manifest_bucket.grant_read_write(memory_registrar_fn)
+        memory_registrar_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "quicksight:CreateDataSource",
+                    "quicksight:CreateDataSet",
+                    "quicksight:CreateIngestion",
+                    "quicksight:DescribeDataSet",
+                    "quicksight:DescribeDataSource",
+                ],
+                resources=[f"arn:aws:quicksight:{qs_region}:{account_id}:*"],
+            )
+        )
+        # S3 read access on memory bucket (cross-stack; bucket ARN from CDK context)
+        if memory_bucket_arn:
+            memory_registrar_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["s3:GetObject"],
+                    resources=[f"{memory_bucket_arn}/*"],
+                )
+            )
+
+        CfnOutput(self, "MemoryRegistrarArn", value=memory_registrar_fn.function_arn,
+                  description="register-memory-source Lambda ARN — invoked by clAWS remember tool")
 
         # -----------------------------------------------------------------
         # Lambda: Snowflake Browse + Preview (AgentCore tools)
@@ -879,6 +944,7 @@ class OpenDataStack(Stack):
             _all_lambda_fns = [
                 sync_fn, search_fn, loader_fn, browse_fn, preview_fn, s3_load_fn,
                 claws_resolver_fn, quality_check_fn, register_source_fn,
+                memory_registrar_fn,
                 snowflake_browse_fn, snowflake_preview_fn,
                 redshift_browse_fn, redshift_preview_fn,
                 federated_search_fn,

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-04-07
+
+### Added
+- `register-memory-source` internal Lambda: registers a clAWS institutional memory NDJSON file as a QuickSight SPICE dataset; idempotent (subsequent calls return existing IDs); invoked via Lambda-to-Lambda from clAWS `remember` tool (#60)
+- `qs-claws-memory-registry` DynamoDB table: stores QuickSight dataset IDs per user ARN hash and dataset type; deletion protection + PITR (#60)
+- CDK: `MemoryRegistrarArn` CfnOutput for cross-stack reference by clAWS v0.17.0 (#60)
+
 ## [0.11.0] - 2026-04-07
 
 ### Added
