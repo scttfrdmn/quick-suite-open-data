@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-04-09
+
+### Added
+- **Issue #37: `requires_transform` dispatch in `roda_load`** — `_TRANSFORM_PROFILES` mapping added to `lambdas/dataset-loader/handler.py`. When the caller-supplied `prefix` key has a non-QuickSight-native extension (`.nc`, `.nc4`, `.h5`, `.hdf5`, `.pdf`, `.geojson`), the handler returns `status: "requires_transform"` with `suggested_profile` (e.g. `ingest-netcdf`, `ingest-pdf-extract`, `ingest-geojson`) and `source_uri` so the caller can route through the compute layer. QuickSight-native formats (`.csv`, `.json`, `.parquet`, `.tsv`) continue to load normally.
+- **Issue #38: Data quality metrics in preview handlers** — `_compute_quality()` function added to `s3-preview`, `snowflake-preview`, and `redshift-preview` handlers. Every preview response now includes a `quality` dict with `row_count`, `null_pct` (per-column), `estimated_cardinality` (per-column unique value count), and `duplicate_row_pct`.
+- **Issue #39: `research_search` tool** — New AgentCore Lambda target (`lambdas/research-search/handler.py`). Searches Zenodo and Figshare public APIs for research datasets. Accepts `query` (required), `sources` (list, default `["zenodo", "figshare"]`), `max_results` (default 20, max 50). Returns `source_type`, `source_id`, `display_name`, `description`, `doi`, `created_at`, `url`, `download_url`. Exponential backoff on 429 responses.
+- **federated_search dispatch extensions** — `_search_zenodo()` and `_search_figshare()` added to `lambdas/federated-search/handler.py`; registered in `_search_fn` dict under keys `"zenodo"` and `"figshare"`.
+- **CDK** — New Lambda construct (`ResearchSearch`) added to `stacks/open_data_stack.py`; included in `_new_tool_fns`, KMS grant list, and `tool_arns` CloudFormation output.
+
+### Tests
+- 15 new tests in `tests/test_quality_sources.py`:
+  - `TestRequiresTransform` (3): .nc returns requires_transform with ingest-netcdf, .csv loads normally, .pdf returns requires_transform with ingest-pdf-extract
+  - `TestQualityMetrics` (6): s3-preview includes quality, null_pct computed correctly, cardinality computed, duplicate detection, empty rows zeroed, snowflake-preview includes quality
+  - `TestResearchSearch` (6): Zenodo happy path, Figshare happy path, 429 retry, empty query error, max_results capped at 50, federated search dispatches zenodo
+
 ## [0.12.0] - 2026-04-07
 
 ### Added

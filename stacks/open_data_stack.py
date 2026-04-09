@@ -872,6 +872,20 @@ class OpenDataStack(Stack):
         )
 
         # -----------------------------------------------------------------
+        # Lambda: Research Search (AgentCore tool — Zenodo + Figshare, public APIs)
+        # -----------------------------------------------------------------
+        research_search_fn = lambda_.Function(
+            self,
+            "ResearchSearch",
+            function_name=f"{prefix}-research-search",
+            runtime=lambda_.Runtime.PYTHON_3_12,
+            handler="handler.handler",
+            code=lambda_.Code.from_asset("lambdas/research-search"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+        )
+
+        # -----------------------------------------------------------------
         # Lambda: Federated Search (AgentCore tool)
         # -----------------------------------------------------------------
         federated_search_fn = lambda_.Function(
@@ -928,6 +942,7 @@ class OpenDataStack(Stack):
             semantic_scholar_search_fn,
             arxiv_search_fn,
             reagent_search_fn,
+            research_search_fn,
         ]
         if gateway_role_arn:
             for fn in [search_fn, loader_fn, browse_fn, preview_fn, s3_load_fn] + _new_tool_fns:
@@ -951,6 +966,7 @@ class OpenDataStack(Stack):
                 ipeds_search_fn, nih_reporter_search_fn, nsf_awards_search_fn,
                 pubmed_search_fn, biorxiv_search_fn, semantic_scholar_search_fn,
                 arxiv_search_fn, reagent_search_fn,
+                research_search_fn,
             ]
             for fn in _all_lambda_fns:
                 cmk.grant(fn.grant_principal, "kms:Decrypt", "kms:GenerateDataKey")
@@ -977,6 +993,7 @@ class OpenDataStack(Stack):
             "semantic_scholar_search": semantic_scholar_search_fn.function_arn,
             "arxiv_search": arxiv_search_fn.function_arn,
             "reagent_search": reagent_search_fn.function_arn,
+            "research_search": research_search_fn.function_arn,
         }
 
         for tool_name, arn_value in tool_arns.items():

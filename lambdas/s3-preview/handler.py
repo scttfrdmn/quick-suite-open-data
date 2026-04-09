@@ -27,6 +27,35 @@ logger.setLevel(logging.INFO)
 
 s3 = boto3.client('s3')
 
+
+def _compute_quality(rows: list[dict]) -> dict:
+    """Compute data quality metrics from sample rows (#38)."""
+    if not rows:
+        return {"row_count": 0, "null_pct": {}, "estimated_cardinality": {}, "duplicate_row_pct": 0.0}
+
+    row_count = len(rows)
+    columns = list(rows[0].keys()) if rows else []
+
+    null_pct = {}
+    cardinality = {}
+    for col in columns:
+        values = [r.get(col) for r in rows]
+        null_count = sum(1 for v in values if v is None or v == "")
+        null_pct[col] = round(null_count / row_count * 100, 1)
+        unique_values = len({str(v) for v in values if v is not None and v != ""})
+        cardinality[col] = unique_values
+
+    # Duplicate detection
+    row_strings = [json.dumps(r, sort_keys=True, default=str) for r in rows]
+    dup_count = row_count - len(set(row_strings))
+
+    return {
+        "row_count": row_count,
+        "null_pct": null_pct,
+        "estimated_cardinality": cardinality,
+        "duplicate_row_pct": round(dup_count / row_count * 100, 1) if row_count > 0 else 0.0,
+    }
+
 try:
     _sources: list[dict] = json.loads(os.environ.get('SOURCES_CONFIG', '[]'))
 except json.JSONDecodeError as e:
@@ -153,6 +182,7 @@ def handler(event: dict, context: Any) -> dict:
         'contentType': content_type,
         'previewBytes': len(content),
         **schema,
+        'quality': _compute_quality(schema.get('sample_rows', [])),
     }
 
 

@@ -522,6 +522,104 @@ def _search_reagents(query_words: list, source: dict) -> list:
     return results
 
 
+def _search_zenodo(query_words: list, source: dict) -> list:
+    """Search Zenodo public research datasets."""
+    import time
+
+    query = " ".join(query_words)
+    if not query:
+        return []
+
+    params = urllib.parse.urlencode({"q": query, "size": 20, "type": "dataset"})
+    url = f"https://zenodo.org/api/records?{params}"
+
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url, headers={"Accept": "application/json", "User-Agent": "quick-suite-data/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    else:
+        return []
+
+    results = []
+    for hit in data.get("hits", {}).get("hits", [])[:20]:
+        meta = hit.get("metadata", {})
+        title = meta.get("title", "")
+        description = (meta.get("description", "") or "")[:200]
+        text = (title + " " + description).lower()
+        matches = sum(1 for w in query_words if w in text)
+        score = min(matches / len(query_words), 1.0) if query_words else 0.0
+        if score > 0:
+            results.append({
+                "source_id": source.get("source_id", f"zenodo/{hit.get('id', '')}"),
+                "source_type": "zenodo",
+                "display_name": title,
+                "match_score": score,
+                "description": description,
+                "quality_score": None,
+            })
+    return results
+
+
+def _search_figshare(query_words: list, source: dict) -> list:
+    """Search Figshare public research articles/datasets."""
+    import time
+
+    query = " ".join(query_words)
+    if not query:
+        return []
+
+    body = json.dumps({"search_for": query, "page_size": 20, "item_type": 3}).encode()
+
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                "https://api.figshare.com/v2/articles/search",
+                data=body, method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json",
+                          "User-Agent": "quick-suite-data/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    else:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    results = []
+    for item in data[:20]:
+        title = item.get("title", "")
+        description = (item.get("description", "") or "")[:200]
+        text = (title + " " + description).lower()
+        matches = sum(1 for w in query_words if w in text)
+        score = min(matches / len(query_words), 1.0) if query_words else 0.0
+        if score > 0:
+            results.append({
+                "source_id": source.get("source_id", f"figshare/{item.get('id', '')}"),
+                "source_type": "figshare",
+                "display_name": title,
+                "match_score": score,
+                "description": description,
+                "quality_score": None,
+            })
+    return results
+
+
 def _search_redshift(query_words: list, source: dict) -> list:
     """List Redshift tables and match names against query words."""
     import time
@@ -662,6 +760,8 @@ def handler(event: dict, context: Any) -> dict:
         "semantic_scholar": _search_semantic_scholar,
         "arxiv": _search_arxiv,
         "reagents": _search_reagents,
+        "zenodo": _search_zenodo,
+        "figshare": _search_figshare,
     }
 
     for source in sources:

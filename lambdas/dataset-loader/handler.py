@@ -44,6 +44,16 @@ QS_DIRECT_FORMATS = {'csv', 'tsv', 'parquet', 'json'}
 MAX_MANIFEST_FILES = 200
 _MAX_PROBE_PAGES = 20  # cap S3 listing at 20 pages (20 * 1000 = 20k objects)
 
+# Formats that require a compute transform profile before QuickSight can ingest (#37)
+_TRANSFORM_PROFILES = {
+    ".nc": "ingest-netcdf",
+    ".nc4": "ingest-netcdf",
+    ".h5": "ingest-netcdf",
+    ".hdf5": "ingest-netcdf",
+    ".pdf": "ingest-pdf-extract",
+    ".geojson": "ingest-geojson",
+}
+
 
 def handler(event: dict, context: Any) -> dict:
     """
@@ -116,6 +126,19 @@ def handler(event: dict, context: Any) -> dict:
                          'The dataset may have an invalid resource definition.'}
 
     requester_pays = resource.get('requesterPays', False)
+
+    # Check if a specific key/prefix requires a compute transform profile (#37)
+    _probe_key = prefix or ""
+    _probe_ext = os.path.splitext(_probe_key)[1].lower() if "." in _probe_key else ""
+    if _probe_ext in _TRANSFORM_PROFILES:
+        return {
+            "status": "requires_transform",
+            "suggested_profile": _TRANSFORM_PROFILES[_probe_ext],
+            "source_uri": f"s3://{bucket_name}/{_probe_key}",
+            "format": _probe_ext.lstrip("."),
+            "message": f"Format '{_probe_ext}' is not QuickSight-native. "
+                       f"Use compute profile '{_TRANSFORM_PROFILES[_probe_ext]}' to transform first.",
+        }
 
     # Detect format if not provided
     detected_formats = item.get('formats', [])
