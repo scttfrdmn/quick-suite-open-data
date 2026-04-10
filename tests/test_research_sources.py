@@ -13,7 +13,6 @@ import importlib.util
 import json
 import os
 import sys
-from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")

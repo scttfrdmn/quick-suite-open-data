@@ -15,9 +15,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -512,7 +510,6 @@ class TestCallerSecretIsolation:
 
     def test_sf_browse_allowed_caller_arn_uses_caller_secret(self):
         import json as _json
-        from io import BytesIO as _BIO
         from unittest.mock import MagicMock as _MM
 
         mod = self._sf_browse(_ALLOWED_PREFIX)
@@ -543,7 +540,7 @@ class TestCallerSecretIsolation:
 
         with patch.object(mod, "secrets_client", mock_sm):
             with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-                result = mod.handler(
+                mod.handler(
                     {"source_id": "sf-prod", "caller_secret_arn": _VALID_CALLER_ARN},
                     _FakeContext(),
                 )
@@ -556,7 +553,6 @@ class TestCallerSecretIsolation:
     def test_absent_caller_arn_uses_shared_secret(self):
         """When caller_secret_arn is absent, the shared secret is used."""
         import json as _json
-        from io import BytesIO as _BIO
         from unittest.mock import MagicMock as _MM
 
         mod = self._sf_browse(_ALLOWED_PREFIX)
@@ -573,7 +569,7 @@ class TestCallerSecretIsolation:
         with patch.object(mod, "secrets_client", mock_sm), \
              patch.object(mod, "SNOWFLAKE_SECRET_ARN", "arn:aws:secretsmanager:us-east-1:123:secret:shared"), \
              patch("urllib.request.urlopen", return_value=mock_resp):
-            result = mod.handler({"source_id": "sf-prod"}, _FakeContext())
+            mod.handler({"source_id": "sf-prod"}, _FakeContext())
 
         mock_sm.get_secret_value.assert_called_with(
             SecretId="arn:aws:secretsmanager:us-east-1:123:secret:shared"

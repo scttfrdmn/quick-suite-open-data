@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import aws_cdk as cdk
+
 from stacks.open_data_stack import OpenDataStack
 
 app = cdk.App()
