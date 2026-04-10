@@ -1,6 +1,6 @@
 [project]
-name = "quick-suite-open-data"
-version = "0.1.0"
+name = "quick-suite-data"
+version = "0.13.0"
 description = "RODA public datasets and institutional S3 browser for Amazon Quick Suite"
 requires-python = ">=3.12"
 dependencies = [
