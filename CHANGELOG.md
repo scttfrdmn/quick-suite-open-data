@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`federated_search` parallel fan-out** — sources were queried serially; with 14 source types at 15–30s HTTP timeouts each, worst-case execution could exceed the 60s MCP tool ceiling. Replaced with `ThreadPoolExecutor(max_workers=8)` fan-out with a 45s overall budget and per-future exception isolation. Total execution time is now bounded by the slowest single source (~30s) rather than the sum of all sources.
+
 ## [0.13.0] - 2026-04-09
 
 ### Added

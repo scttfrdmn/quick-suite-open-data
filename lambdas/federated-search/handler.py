@@ -14,6 +14,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import boto3
@@ -764,18 +765,32 @@ def handler(event: dict, context: Any) -> dict:
         "figshare": _search_figshare,
     }
 
-    for source in sources:
-        source_id = source.get("source_id", "")
-        source_type = source.get("type", "")
-        fn = _search_fn.get(source_type)
-        if fn is None:
-            continue
+    # Fan out to all sources in parallel. Total budget is 45s — comfortably
+    # under the 60s MCP ceiling — with individual per-source HTTP timeouts
+    # (15–30s each) preventing any single slow source from blocking others.
+    _FANOUT_TIMEOUT = 45
+    pending: dict = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for source in sources:
+            source_id = source.get("source_id", "")
+            fn = _search_fn.get(source.get("type", ""))
+            if fn is None:
+                continue
+            pending[executor.submit(fn, query_words, source)] = source_id
         try:
-            hits = fn(query_words, source)
-            results.extend(hits)
-        except Exception as e:
-            logger.warning(json.dumps({"skipped_source": source_id, "error": str(e)}))
-            skipped_sources.append(source_id)
+            for future in as_completed(pending, timeout=_FANOUT_TIMEOUT):
+                source_id = pending[future]
+                try:
+                    hits = future.result()
+                    results.extend(hits)
+                except Exception as e:
+                    logger.warning(json.dumps({"skipped_source": source_id, "error": str(e)}))
+                    skipped_sources.append(source_id)
+        except TimeoutError:
+            for future, source_id in pending.items():
+                if not future.done():
+                    logger.warning(json.dumps({"skipped_source": source_id, "error": "fanout timeout"}))
+                    skipped_sources.append(source_id)
 
     # Sort by match_score descending, then cap
     results.sort(key=lambda r: r.get("match_score", 0.0), reverse=True)
