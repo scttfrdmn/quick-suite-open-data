@@ -51,7 +51,7 @@ research funding data from three federal sources.
 | | `nih_reporter_search` | NIH Reporter v2 API (public, no auth); fiscal year, institution, PI name filters |
 | | `nsf_awards_search` | NSF Award Search API (public, no auth); date range, PI name filters |
 | | `research_search` | Zenodo + Figshare public API search with 429 exponential backoff |
-| Cross-source | `federated_search` | Unified search across all 12+ registered source types; keyword scoring; `data_classification_filter`; `skipped_sources` reporting |
+| Cross-source | `federated_search` | Unified search across all 12+ registered source types; parallel fan-out via `ThreadPoolExecutor` (45s budget); keyword scoring; `data_classification_filter`; `skipped_sources` reporting |
 
 **Per-caller credential isolation:** Snowflake and Redshift tools accept optional
 `caller_secret_arn` validated against an ARN prefix allowlist — no shared service account
