@@ -404,3 +404,81 @@ class TestFederatedSearch:
         source_ids = [r["source_id"] for r in result["results"]]
         assert "s3-public-b" in source_ids
         assert "s3-internal-a" not in source_ids
+
+    # -----------------------------------------------------------------------
+    # Parallel fan-out behavior (ThreadPoolExecutor)
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.integration
+    def test_parallel_fanout_all_sources_complete(self, substrate_url, reset_substrate, monkeypatch):
+        """All sources return results — none skipped, all hits collected."""
+        from unittest.mock import patch
+
+        resource = self._create_tables(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
+        for sid, stype in [("roda-a", "roda"), ("s3-b", "s3"), ("ipeds-c", "ipeds")]:
+            self._put_registry(resource,
+                source_id=sid, type=stype,
+                display_name=f"{stype} dataset", description="test data",
+                data_classification="public", connection_config="{}",
+            )
+
+        hit = {"source_id": "x", "source_type": "roda", "display_name": "x",
+               "description": "x", "match_score": 1.0}
+
+        with patch.object(mod, "_search_roda", return_value=[hit]), \
+             patch.object(mod, "_search_s3", return_value=[hit]), \
+             patch.object(mod, "_search_ipeds", return_value=[hit]):
+            result = mod.handler({"query": "test"}, None)
+
+        assert result["total"] == 3
+        assert result["skipped_sources"] == []
+
+    @pytest.mark.integration
+    def test_parallel_fanout_one_source_raises(self, substrate_url, reset_substrate, monkeypatch):
+        """One source raises; others succeed. Failed source lands in skipped_sources."""
+        from unittest.mock import patch
+
+        resource = self._create_tables(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
+        for sid, stype in [("roda-a", "roda"), ("s3-b", "s3")]:
+            self._put_registry(resource,
+                source_id=sid, type=stype,
+                display_name=f"{stype} dataset", description="test data",
+                data_classification="public", connection_config="{}",
+            )
+
+        hit = {"source_id": "roda-a", "source_type": "roda", "display_name": "x",
+               "description": "x", "match_score": 0.8}
+
+        with patch.object(mod, "_search_roda", side_effect=RuntimeError("roda down")), \
+             patch.object(mod, "_search_s3", return_value=[hit]):
+            result = mod.handler({"query": "test"}, None)
+
+        assert result["total"] == 1
+        assert "roda-a" in result["skipped_sources"]
+
+    @pytest.mark.integration
+    def test_parallel_fanout_global_timeout_skips_pending(self, substrate_url, reset_substrate, monkeypatch):
+        """as_completed timeout fires — pending sources added to skipped_sources."""
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+        from unittest.mock import patch
+
+        resource = self._create_tables(substrate_url)
+        mod = self._reload(substrate_url, monkeypatch)
+
+        for sid, stype in [("roda-a", "roda"), ("s3-b", "s3")]:
+            self._put_registry(resource,
+                source_id=sid, type=stype,
+                display_name=f"{stype} dataset", description="test",
+                data_classification="public", connection_config="{}",
+            )
+
+        # Patch as_completed in the loaded module to raise TimeoutError immediately
+        with patch.object(mod, "as_completed", side_effect=FuturesTimeoutError()):
+            result = mod.handler({"query": "test"}, None)
+
+        assert result["total"] == 0
+        assert len(result["skipped_sources"]) == 2
